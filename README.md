@@ -1058,6 +1058,132 @@ flowchart LR
 > [!TIP]
 > Run `python src/main.py train` to watch the weights being learned from nothing. The loss printed each epoch drops as the model figures out the endpoint equality pattern. The final weights saved to `artifacts/transformer.pt` are the result of that entire learning process - nothing was loaded from outside.
 
+> [!NOTE]
+> **What is loss?**
+>
+> Loss is a single number that measures how wrong the model is right now. Specifically it answers: "given the model's current weights, how badly does it predict the correct labels?" A loss of 0.0 would mean every prediction is perfectly correct and perfectly confident. A high loss (e.g. 0.69 at the start) means the model is essentially guessing randomly.
+>
+> In this project, the loss function is **CrossEntropyLoss**. It works like this: the model outputs two numbers for each sequence - one score for "label 0 (no duplicate)" and one score for "label 1 (duplicate)." CrossEntropy converts those scores into probabilities with softmax, then measures how far those probabilities are from the true answer. If the true label is 1 and the model said "90% chance it is 1" - low loss. If the model said "10% chance it is 1" - high loss.
+>
+> **What CrossEntropyLoss actually is - a full breakdown.**
+>
+> "Cross entropy" comes from information theory. It measures the difference between two probability distributions - the distribution the model predicted and the true distribution (which is just 100% on the correct class, 0% on everything else). The name sounds intimidating but the formula collapses to something very simple for classification: **take the negative log of the probability the model assigned to the correct answer.**
+>
+> That is it. `-log(p_correct)`. Here is why that formula works so well:
+>
+> - If the model is very confident and correct - e.g. it says 95% chance of the right label - then `-log(0.95) = 0.05`. Very small loss, almost no punishment.
+> - If the model is uncertain - e.g. it says 50% chance of the right label (coin flip) - then `-log(0.50) = 0.69`. Medium loss. This is why an untrained model starts at ~0.69 on a binary task - it is outputting near-random probabilities.
+> - If the model is confident and wrong - e.g. it says 5% chance of the right label - then `-log(0.05) = 3.0`. Very high loss, strong correction signal sent back through backpropagation.
+>
+> The `-log` function is the key. It is a curve that goes to infinity as the predicted probability approaches 0, and reaches 0 only when the predicted probability reaches 1.0. This means the model is never "done" - it can always get a slightly lower loss by becoming more confident in correct predictions.
+>
+> ```
+> How -log(p) behaves:
+>
+>   p (predicted prob for correct class)   -log(p)  = loss contribution
+>   ─────────────────────────────────────────────────────────────────────
+>   0.99  (very confident, correct)          0.01    <- almost no punishment
+>   0.90  (confident, correct)               0.11    <- small punishment
+>   0.70  (fairly confident, correct)        0.36    <- moderate
+>   0.50  (uncertain, coin flip)             0.69    <- this is where training starts
+>   0.30  (leaning wrong way)                1.20    <- significant punishment
+>   0.10  (confident in wrong answer)        2.30    <- strong correction
+>   0.01  (very confident, very wrong)       4.61    <- severe punishment
+>
+> The graph of -log(p):
+>
+>   Loss
+>   5 |  *
+>   4 |   *
+>   3 |    *
+>   2 |      *
+>   1 |          *
+>   0 |                            *  *  *  *  *
+>     +─────────────────────────────────────────
+>     0.0                                      1.0    p (model confidence in correct answer)
+>
+>   Starts at infinity when p=0, reaches 0 only at p=1.0
+> ```
+>
+> **The three steps CrossEntropyLoss does internally:**
+>
+> 1. **Receive raw logits.** The model outputs raw unnormalized scores - e.g. `[2.1, 0.4]` for the two classes. These can be any numbers, positive or negative. They are called logits.
+>
+> 2. **Apply softmax to convert to probabilities.** Softmax divides each exponentiated score by the sum of all exponentiated scores: `e^2.1 / (e^2.1 + e^0.4) = 8.17 / (8.17 + 1.49) = 0.85`. Now the two numbers sum to 1.0 and can be interpreted as probabilities.
+>
+> 3. **Apply negative log to the correct class probability only.** Look up which class is the true label, take that probability, compute `-log(p)`. That single number is the loss for this one example. Over a batch of 64 examples, the 64 individual losses are averaged to get one batch loss.
+>
+> **Why not just use accuracy as the loss?** Accuracy is either 0 or 1 per example (right or wrong) - it has no gradient. If the model changes a weight slightly and the prediction is still wrong, accuracy does not change at all - there is no signal telling the model which direction to adjust. CrossEntropy is continuous and smooth, so even a tiny weight change produces a tiny change in loss, and that tiny change is enough for backpropagation to know which direction to push.
+>
+> ```
+> Example - sequence [7, 3, 11, 7, 5, 2], true label = 0 (no endpoint match):
+>
+>   Model output logits:   [2.1,  0.4]      <- raw scores, not yet probabilities
+>   After softmax:         [0.83, 0.17]     <- 83% chance label=0, 17% chance label=1
+>   True label:            [1.0,  0.0]      <- we wanted 100% on label=0
+>
+>   CrossEntropyLoss = -log(0.83) = 0.19    <- low loss, model was mostly right
+>
+> Example - same sequence, model not yet trained:
+>
+>   Model output logits:   [0.1, -0.2]      <- random near-zero weights
+>   After softmax:         [0.57, 0.43]     <- barely a preference
+>   True label:            [1.0,  0.0]
+>
+>   CrossEntropyLoss = -log(0.57) = 0.56    <- higher loss, model was barely better than a coin flip
+> ```
+>
+> Loss is the signal that drives all learning. After every batch, PyTorch computes how much each weight contributed to the loss (via backpropagation), and the Adam optimizer nudges each weight slightly in the direction that would have made the loss smaller. Do this enough times and the loss falls.
+
+> [!NOTE]
+> **What is an epoch?**
+>
+> One epoch is one complete pass through the entire training dataset. The training set here has 4,000 sequences. With a batch size of 64, one epoch = 4000 / 64 = **62 gradient update steps**. Each step reads one batch of 64 sequences, runs a forward pass, computes the loss, runs backpropagation, and updates the weights. After 62 steps, every training sequence has been seen once - that is one epoch done.
+>
+> The model trains for 15 epochs by default, meaning it sees all 4,000 sequences 15 times. Each time through, the weights are slightly better than the last time, so the model gets better predictions even on sequences it has already seen. This is not memorization - the weight updates are general enough that the model also improves on the 800 validation sequences it has never trained on.
+>
+> ```
+> Epoch 1:
+>   Step 1:  batch of sequences 0-63    -> loss = 0.68  -> update weights
+>   Step 2:  batch of sequences 64-127  -> loss = 0.65  -> update weights
+>   ...
+>   Step 62: batch of sequences 3968-3999 -> loss = 0.55 -> update weights
+>   [Validation pass - no weight updates, just measure how well we are doing]
+>   Epoch 1 summary: train_loss=0.61  val_loss=0.58  val_acc=68%
+>
+> Epoch 2:
+>   Same 4000 sequences, reshuffled into new batches
+>   Weights are now better, so predictions are already slightly better
+>   Step 1:  loss = 0.52  -> update weights
+>   ...
+>   Epoch 2 summary: train_loss=0.45  val_loss=0.43  val_acc=81%
+>
+> Epoch 15:
+>   ...
+>   Epoch 15 summary: train_loss=0.08  val_loss=0.09  val_acc=97%
+> ```
+
+> [!NOTE]
+> **What is actually happening inside one epoch - step by step?**
+>
+> Here is the exact sequence of events for a single training step within an epoch, traced through the code:
+>
+> 1. **Load a batch.** The DataLoader picks 64 random sequences from the training set and stacks them into a tensor of shape `(64, 16)` - 64 sequences, each 16 tokens long. It also provides the 64 correct labels.
+>
+> 2. **Zero the gradients.** `optimizer.zero_grad()` clears any gradient values left over from the previous step. If you skip this, gradients accumulate and weights update incorrectly.
+>
+> 3. **Forward pass.** The batch is fed into `TransformerSequenceClassifier.forward()`. Token and positional embeddings are looked up and summed. The result passes through both encoder blocks (attention + FFN + residuals). Mean pooling collapses the sequence dimension. The classifier head produces logits of shape `(64, 2)`.
+>
+> 4. **Compute the loss.** `CrossEntropyLoss` compares the 64 predicted logit pairs against the 64 true labels. It returns one number - the average loss across the batch.
+>
+> 5. **Backward pass.** `loss.backward()` traces back through every operation in the forward pass and computes the gradient of the loss with respect to every weight in the model. This uses the chain rule of calculus automatically. Every weight now has a `.grad` value saying "if I increase this weight slightly, the loss goes up/down by this much."
+>
+> 6. **Weight update.** `optimizer.step()` reads every weight's `.grad` value and applies the Adam update rule - a slightly more sophisticated version of "move each weight a small step in the direction that decreases loss." Adam also tracks momentum (recent gradient history) to smooth out noisy updates.
+>
+> 7. **Repeat 62 times.** After all 62 batches, the epoch is done. Then one validation pass runs steps 1 and 3 only (no backward, no update - just measuring) to see how well the current weights perform on unseen data.
+>
+> The whole loop then repeats from epoch 2, starting with reshuffled batches but keeping the weights from where epoch 1 left off.
+
 #### Training Loss Curve Interpretation
 
 When you run `python src/main.py visualize`, the file `artifacts/training_comparison.png` shows the loss and accuracy curves per epoch. Knowing how to read these curves tells you whether training went well, whether you should train longer, and whether something went wrong. The table below covers every common pattern.
@@ -1249,6 +1375,62 @@ After running `train` and `visualize`, the `artifacts/` directory will contain t
 | 4 | <sub>`attention_heatmap_layer0.png`</sub> | <sub>visualize</sub> | <sub>Grid of attention weight heatmaps for encoder block 1</sub> |
 | 5 | <sub>`attention_heatmap_layer1.png`</sub> | <sub>visualize</sub> | <sub>Grid of attention weight heatmaps for encoder block 2</sub> |
 | 6 | <sub>`training_comparison.png`</sub> | <sub>visualize</sub> | <sub>Side-by-side training and validation curves for both models</sub> |
+
+> [!NOTE]
+> **What is actually inside a `.pt` file? Is it matrices, variables, values?**
+>
+> A `.pt` file is a binary file created by PyTorch's `torch.save()`. It uses a format called **pickle** (Python's standard serialization format) combined with PyTorch's own tensor storage. The file contains no code - only data.
+>
+> What is stored inside is called a **`state_dict`** - a Python dictionary where every key is the name of a weight matrix in the model, and every value is that matrix as a multi-dimensional array of floating-point numbers (a PyTorch tensor). So yes: it is matrices, variables, and values all at once.
+>
+> Here is what the keys and shapes inside `transformer.pt` actually look like:
+>
+> ```python
+> import torch
+> state = torch.load("artifacts/transformer.pt", weights_only=True)
+> for key, tensor in state.items():
+>     print(f"{key:55s}  shape={list(tensor.shape)}")
+>
+> # Output:
+> embedding.token_embedding.weight               shape=[20, 64]
+> embedding.pos_embedding.weight                 shape=[16, 64]
+> blocks.0.self_attn.W_Q.weight                  shape=[64, 64]
+> blocks.0.self_attn.W_K.weight                  shape=[64, 64]
+> blocks.0.self_attn.W_V.weight                  shape=[64, 64]
+> blocks.0.self_attn.W_O.weight                  shape=[64, 64]
+> blocks.0.ff.linear1.weight                     shape=[128, 64]
+> blocks.0.ff.linear1.bias                       shape=[128]
+> blocks.0.ff.linear2.weight                     shape=[64, 128]
+> blocks.0.ff.linear2.bias                       shape=[64]
+> blocks.0.norm1.weight                          shape=[64]
+> blocks.0.norm1.bias                            shape=[64]
+> blocks.0.norm2.weight                          shape=[64]
+> blocks.0.norm2.bias                            shape=[64]
+> blocks.1.self_attn.W_Q.weight                  shape=[64, 64]   <- Block 2 has its own copies
+> ...                                                              <- (same structure as Block 1)
+> classifier.0.weight                            shape=[64, 64]
+> classifier.0.bias                              shape=[64]
+> classifier.3.weight                            shape=[2, 64]
+> classifier.3.bias                              shape=[2]
+> ```
+>
+> Every value in every tensor is a single 32-bit floating-point number (4 bytes). For example, `embedding.token_embedding.weight` with shape `[20, 64]` contains exactly 20 x 64 = 1,280 individual float values. That matrix alone takes 1,280 x 4 = 5,120 bytes. The entire `transformer.pt` file for this model is roughly **290 KB** - tiny compared to even the smallest production models.
+>
+> When you run `evaluate` or `visualize`, the code calls `model.load_state_dict(torch.load("artifacts/transformer.pt"))`. This reads every key from the file and copies the saved tensor values back into the matching layer of the freshly created model object. The model architecture (the Python class with all its layers) is defined in code. The `.pt` file only provides the numbers that fill those layers. Without the matching architecture code, the `.pt` file is useless on its own.
+>
+> ```
+> .pt file (the numbers):          Python class (the structure):
+>
+> "W_Q.weight": [[0.42, -0.11,     class MultiHeadSelfAttention:
+>                  0.77,  0.03,        self.W_Q = nn.Linear(64, 64)
+>                  ...]]               self.W_K = nn.Linear(64, 64)
+> "W_K.weight": [[-0.23, 0.54,         ...
+>                  ...]]
+>                                   load_state_dict() matches keys
+>                                   and fills in the numbers ------^
+> ```
+>
+> In short: the `.pt` file is a snapshot of every learned number in the model at the moment training ended. Load it back in and the model immediately behaves exactly as it did after 15 epochs of training - no retraining needed.
 
 ---
 
