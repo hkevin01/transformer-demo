@@ -446,10 +446,63 @@ The complete `TransformerSequenceClassifier` stacks two encoder blocks. Token ID
 > **What is a Token ID?** A token is the basic unit of input to the model. In real NLP systems a token might be a word or sub-word piece; in this project tokens are simply integers sampled from `[0, vocab_size)`. A **Token ID** is the integer that identifies which vocabulary entry a position holds - for example, token ID `7` might represent the word "cat" in a real vocabulary, or just abstract symbol 7 in this toy task. The model converts token IDs into dense floating-point vectors through an embedding lookup table (`nn.Embedding`), which maps each integer to a unique learned 64-dimensional vector. The same token ID always maps to the same vector, regardless of where in the sequence it appears - that is why the positional embedding is added on top, to inject position information.
 
 > [!NOTE]
-> **Encoder Block vs Encoder Stack:** A single **encoder block** is one processing layer (attention + FFN + residual + norm). The **encoder stack** (set by `--num-layers`) is multiple blocks wired sequentially. Block 2 receives the enriched output of Block 1 as its input and can build higher-level abstractions on top of it. Early blocks tend to learn surface-level token interactions; later blocks can learn more abstract compositional patterns. In this project the stack depth is 2, which is minimal but sufficient for the toy classification task.
+> **Encoder Block vs Encoder Stack:** A single **encoder block** is one processing layer (attention + FFN + residual + norm). The **encoder stack** (set by `--num-layers`) is multiple blocks wired sequentially.
+
+```mermaid
+flowchart LR
+    TID["Token IDs  e.g. 7, 3, 11, 7, 5, 2\nbatch x seq_len  integers"]
+    TEMB["Token Embedding lookup\nnn.Embedding  vocab x 64\neach integer maps to a 64-dim vector"]
+    PVEC["Position Indices  0, 1, 2, ...15\nalways the same for seq_len=16"]
+    PEMB["Positional Embedding lookup\nnn.Embedding  max_seq_len x 64\neach slot maps to a unique 64-dim vector"]
+    ADD["Element-wise Add\nbatch x seq_len x 64\ntoken identity + slot position fused"]
+    OUT["Input to Encoder Block 1\nbatch x seq_len x 64\neach position now knows WHAT it is and WHERE it is"]
+
+    TID --> TEMB --> ADD
+    PVEC --> PEMB --> ADD
+    ADD --> OUT
+
+    style TID fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style TEMB fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style PVEC fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style PEMB fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style ADD fill:#f97316,stroke:#c2410c,color:#fff
+    style OUT fill:#22c55e,stroke:#15803d,color:#fff
+```
+
+> [!NOTE]
+> The two embedding tables are completely independent - token embeddings encode meaning, positional embeddings encode slot location. Neither one alone is sufficient. Without the token embedding the model cannot tell which symbol is at a position. Without the positional embedding the model cannot tell which position a symbol occupies. The sum gives both simultaneously in one 64-dim vector per token. Block 2 receives the enriched output of Block 1 as its input and can build higher-level abstractions on top of it. Early blocks tend to learn surface-level token interactions; later blocks can learn more abstract compositional patterns. In this project the stack depth is 2, which is minimal but sufficient for the toy classification task.
 
 > [!NOTE]
 > **What is Mean Pooling?** After the encoder stack, we have a tensor of shape `(batch, seq_len, embed_dim)` - one 64-dimensional vector for each of the 16 token positions. To classify the whole sequence with a single label, we need one vector. Mean pooling computes the arithmetic mean across the sequence dimension, producing `(batch, embed_dim)`. It is the simplest possible aggregation: take every token's representation and average them. The critical limitation is that mean pooling is permutation-invariant - it cannot tell you where in the sequence a pattern occurred, only that it occurred somewhere. This is why the baseline model (which also uses mean pooling but lacks attention) cannot reliably solve the first-equals-last task: after averaging, all positional information is gone.
+
+```mermaid
+flowchart TD
+    SEQ["After Encoder Stack\nbatch x 16 x 64\n16 separate vectors - one per position"]
+    P0["Position 0 vector\n64 numbers - knows tok=7 is at slot 0"]
+    P1["Position 1 vector\n64 numbers"]
+    DOTS["Positions 2 through 14\n13 more vectors"]
+    P15["Position 15 vector\n64 numbers - knows tok=7 is at slot 15"]
+    POOL["Mean Pool  average all 16 vectors element-wise\nbatch x 64\nONE vector per sequence"]
+    NOTE["Slot identity is gone\nThe averaged vector knows tok=7 appeared\nbut not whether it was at slot 0 or slot 15"]
+
+    SEQ --> P0
+    SEQ --> P1
+    SEQ --> DOTS
+    SEQ --> P15
+    P0 --> POOL
+    P1 --> POOL
+    DOTS --> POOL
+    P15 --> POOL
+    POOL --> NOTE
+
+    style SEQ fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style P0 fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style P1 fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style DOTS fill:#6b7280,stroke:#374151,color:#fff
+    style P15 fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style POOL fill:#f97316,stroke:#c2410c,color:#fff
+    style NOTE fill:#dc2626,stroke:#991b1b,color:#fff
+```
 
 ```mermaid
 flowchart TD
@@ -516,6 +569,41 @@ Every operation in the forward pass transforms the tensor shape in a specific wa
 ### Training Pipeline
 
 Both the Transformer and the Baseline are trained using the same data splits, optimizer family, and loss function so the comparison is apples-to-apples. Each epoch runs a full pass over the training set with gradient updates, followed by a validation pass in `torch.no_grad()` context. Metrics are collected per epoch and persisted at the end.
+
+```mermaid
+flowchart TD
+    START["Start Epoch N\nshuffle training set"]
+    BATCH["Load next batch\n64 sequences + 64 labels"]
+    ZERO["optimizer.zero_grad\nclear leftover gradients"]
+    FWD["Forward pass\nbatch through model  get logits shape 64 x 2"]
+    LOSS["Compute CrossEntropyLoss\ncompare logits to true labels  one scalar"]
+    BWD["loss.backward\ncompute gradient for every weight"]
+    STEP["optimizer.step\nAdam nudges every weight toward lower loss"]
+    MORE["More batches this epoch?"]
+    VAL["Validation pass  no_grad\nforward only  compute val loss and accuracy"]
+    LOG["Log metrics for epoch N\ntrain loss  val loss  val accuracy"]
+    DONE["All epochs done?"]
+    SAVE["Save best checkpoint\nartifacts/transformer.pt"]
+
+    START --> BATCH --> ZERO --> FWD --> LOSS --> BWD --> STEP --> MORE
+    MORE -->|"yes  62 batches per epoch"| BATCH
+    MORE -->|"no"| VAL --> LOG --> DONE
+    DONE -->|"no"| START
+    DONE -->|"yes"| SAVE
+
+    style START fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style BATCH fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style ZERO fill:#6b7280,stroke:#374151,color:#fff
+    style FWD fill:#14b8a6,stroke:#0f766e,color:#fff
+    style LOSS fill:#f97316,stroke:#c2410c,color:#fff
+    style BWD fill:#f97316,stroke:#c2410c,color:#fff
+    style STEP fill:#f97316,stroke:#c2410c,color:#fff
+    style MORE fill:#fbbf24,stroke:#d97706,color:#000
+    style VAL fill:#6b7280,stroke:#374151,color:#fff
+    style LOG fill:#6b7280,stroke:#374151,color:#fff
+    style DONE fill:#fbbf24,stroke:#d97706,color:#000
+    style SAVE fill:#22c55e,stroke:#15803d,color:#fff
+```
 
 #### Training Hyperparameter Reference
 
@@ -979,6 +1067,130 @@ When you open the saved heatmap images, each cell `[i, j]` is a color from dark 
 | 7 | <sub>Near-diagonal band</sub> | <sub>Bright band 1-2 cells away from the main diagonal</sub> | <sub>Every token attends mostly to its immediate neighbors</sub> | <sub>Healthy for Head 2 proximity - local context window behavior</sub> | <sub>Head 2 tracking "what tokens are next to me"</sub> |
 | 8 | <sub>Single saturated cell</sub> | <sub>One cell is 1.0, all others in the row are 0.0</sub> | <sub>Softmax has saturated - model is 100% certain about one source</sub> | <sub>Concerning - means gradient flow to all other positions is zero</sub> | <sub>Symptom of missing scaling by sqrt(d_k)</sub> |
 
+```mermaid
+flowchart TD
+    PA_TITLE["Pattern A  Saturated  BAD"]
+    PA["Row 0:  0.99  0.00  0.00  0.00  0.00  0.00"]
+    PA2["Row 1:  0.00  0.98  0.00  0.00  0.00  0.00"]
+    PA3["Row 2:  0.00  0.00  0.97  0.00  0.00  0.00"]
+    PA_NOTE["Each row has one winner  everyone else is zero\nGradient cannot reach most positions\nFix: verify sqrt head_dim scaling"]
+
+    PB_TITLE["Pattern B  Flat  UNDERTRAINED"]
+    PB["Row 0:  0.17  0.16  0.17  0.16  0.17  0.17"]
+    PB2["Row 1:  0.16  0.17  0.17  0.16  0.17  0.17"]
+    PB3["Row 2:  0.17  0.16  0.16  0.17  0.17  0.17"]
+    PB_NOTE["All cells roughly equal  head is averaging  not discriminating\nFix: more epochs or higher learning rate"]
+
+    PC_TITLE["Pattern C  Off-diagonal Bright Spots  TARGET"]
+    PC["Row 0:  0.08  0.05  0.06  0.05  0.07  0.69  pos 0 attends to pos 5 - match"]
+    PC2["Row 3:  0.05  0.06  0.05  0.07  0.06  0.71  pos 3 also attends to matching pos"]
+    PC3["Row 5:  0.72  0.05  0.05  0.06  0.05  0.07  pos 5 attends back to pos 0"]
+    PC_NOTE["High weights at [0 match] and [match 0]  model found the duplicate pair\nThis is the head that is solving the task"]
+
+    PA_TITLE --> PA --> PA2 --> PA3 --> PA_NOTE
+    PB_TITLE --> PB --> PB2 --> PB3 --> PB_NOTE
+    PC_TITLE --> PC --> PC2 --> PC3 --> PC_NOTE
+
+    style PA_TITLE fill:#dc2626,stroke:#991b1b,color:#fff
+    style PA fill:#fca5a5,stroke:#dc2626,color:#000
+    style PA2 fill:#fca5a5,stroke:#dc2626,color:#000
+    style PA3 fill:#fca5a5,stroke:#dc2626,color:#000
+    style PA_NOTE fill:#dc2626,stroke:#991b1b,color:#fff
+    style PB_TITLE fill:#d97706,stroke:#92400e,color:#fff
+    style PB fill:#fde68a,stroke:#d97706,color:#000
+    style PB2 fill:#fde68a,stroke:#d97706,color:#000
+    style PB3 fill:#fde68a,stroke:#d97706,color:#000
+    style PB_NOTE fill:#d97706,stroke:#92400e,color:#fff
+    style PC_TITLE fill:#059669,stroke:#065f46,color:#fff
+    style PC fill:#6ee7b7,stroke:#059669,color:#000
+    style PC2 fill:#6ee7b7,stroke:#059669,color:#000
+    style PC3 fill:#6ee7b7,stroke:#059669,color:#000
+    style PC_NOTE fill:#059669,stroke:#065f46,color:#fff
+```
+
+---
+
+#### How the PNG Files Are Produced
+
+When you run `python -m src.main visualize`, `src/visualize.py` does the following:
+
+1. Loads the saved model weights from `artifacts/transformer.pt`
+2. Picks one sequence from the test set (default: sample index 0)
+3. Runs a forward pass with `torch.no_grad()` - no training, just prediction
+4. The model's `forward()` method saves a copy of the softmax attention weights for every head and every layer into `self.attention_maps` as it runs
+5. For each encoder layer, `plot_attention_heatmaps()` calls `seaborn.heatmap()` on the `(seq_len, seq_len)` weight matrix for each of the 4 heads
+6. The x-axis labels are the key token IDs (what each column represents as a source), the y-axis labels are the query token IDs (what each row represents as a reader)
+7. Color scale: `viridis` colormap - dark purple = near 0.0 (almost no attention), bright yellow = near 1.0 (almost all attention)
+8. One PNG per layer is saved: `artifacts/attention_heatmap_layer1.png`, `artifacts/attention_heatmap_layer2.png`
+
+Each PNG contains a row of 4 side-by-side heatmaps - one per head. The title of each subplot reads "Layer N Head M".
+
+---
+
+#### What a Good Heatmap Looks Like vs a Bad One
+
+The grids below use characters to simulate the viridis color scale.
+`░` = near 0.0 (dark, low attention) - `▒` = 0.2-0.5 (medium) - `▓` = 0.6-0.8 (high) - `█` = near 1.0 (bright yellow, maximum attention)
+
+Columns are key positions (source), rows are query positions (who is reading).
+This example uses a 6-token sequence: `[7, 3, 11, 5, 2, 7]` - positions 0 and 5 both hold token 7, so `tokens[0] == tokens[5]`, label = 1.
+
+**GOOD heatmap - Head 1 after sufficient training (task-solving head):**
+```
+         Key: pos0  pos1  pos2  pos3  pos4  pos5
+              tok7  tok3 tok11  tok5  tok2  tok7
+              ----  ----  ----  ----  ----  ----
+Query pos0 |  ▒     ░     ░     ░     ░     █    <- pos0 attends strongly to pos5 (same token!)
+Query pos1 |  ░     ▒     ░     ░     ░     ░    <- pos1 finds no match, diffuse
+Query pos2 |  ░     ░     ▒     ░     ░     ░    <- pos2 finds no match, diffuse
+Query pos3 |  ░     ░     ░     ▒     ░     ░    <- pos3 finds no match, diffuse
+Query pos4 |  ░     ░     ░     ░     ▒     ░    <- pos4 finds no match, diffuse
+Query pos5 |  █     ░     ░     ░     ░     ▒    <- pos5 attends strongly back to pos0 (same token!)
+```
+The bright cells at `[0,5]` and `[5,0]` are the signal: the model found the matching endpoint pair. This head is directly solving the task. Val accuracy with this pattern: ~97%.
+
+**BAD heatmap - saturated (scaling missing or learning rate too high early):**
+```
+         Key: pos0  pos1  pos2  pos3  pos4  pos5
+              ----  ----  ----  ----  ----  ----
+Query pos0 |  █     ░     ░     ░     ░     ░    <- locked onto itself, cannot learn
+Query pos1 |  ░     █     ░     ░     ░     ░    <- locked onto itself
+Query pos2 |  ░     ░     █     ░     ░     ░    <- locked onto itself
+Query pos3 |  ░     ░     ░     █     ░     ░    <- locked onto itself
+Query pos4 |  ░     ░     ░     ░     █     ░    <- locked onto itself
+Query pos5 |  ░     ░     ░     ░     ░     █    <- locked onto itself
+```
+Pure identity matrix. Every position only attends to itself - zero cross-token communication. Gradients for all off-diagonal cells are zero. The model has learned nothing about relationships. Fix: add `/ math.sqrt(head_dim)` scaling.
+
+**BAD heatmap - flat/undertrained:**
+```
+         Key: pos0  pos1  pos2  pos3  pos4  pos5
+              ----  ----  ----  ----  ----  ----
+Query pos0 |  ▒     ▒     ▒     ▒     ▒     ▒    <- no preference anywhere
+Query pos1 |  ▒     ▒     ▒     ▒     ▒     ▒    <- computing a plain average
+Query pos2 |  ▒     ▒     ▒     ▒     ▒     ▒
+Query pos3 |  ▒     ▒     ▒     ▒     ▒     ▒
+Query pos4 |  ▒     ▒     ▒     ▒     ▒     ▒
+Query pos5 |  ▒     ▒     ▒     ▒     ▒     ▒    <- all rows identical
+```
+Completely uniform - this head is contributing a plain average of all token values, no different from mean pooling. It has not learned to distinguish positions. Fix: train longer or raise learning rate.
+
+**ACCEPTABLE heatmap - Head 2 proximity head (not task-solving but healthy):**
+```
+         Key: pos0  pos1  pos2  pos3  pos4  pos5
+              ----  ----  ----  ----  ----  ----
+Query pos0 |  ▓     ▒     ░     ░     ░     ░    <- attends to self + right neighbor
+Query pos1 |  ▒     ▓     ▒     ░     ░     ░    <- attends to neighbors on both sides
+Query pos2 |  ░     ▒     ▓     ▒     ░     ░
+Query pos3 |  ░     ░     ▒     ▓     ▒     ░
+Query pos4 |  ░     ░     ░     ▒     ▓     ▒
+Query pos5 |  ░     ░     ░     ░     ▒     ▓    <- attends to self + left neighbor
+```
+Bright band along the main diagonal with a 1-cell shoulder on each side. This head learned local context - "what tokens are near me?" It is not solving the endpoint equality task directly, but it provides useful local structure to the next encoder block.
+
+> [!TIP]
+> In a well-trained 2-block 4-head model on this task you should expect roughly: one head showing the `[0,15]` off-diagonal pattern (task-solving), one head showing a diagonal proximity band, one head showing a lower-triangular pattern (repetition lookback), and one head showing near-uniform weights (fallback). If all four heads look identical, the model has collapsed into redundant representations and you should add dropout or reduce embed-dim.
+
 ---
 
 ## Where Does the Data Come From? How Does the Model Know Anything?
@@ -1202,7 +1414,26 @@ flowchart LR
 > ```
 >
 > **The three steps CrossEntropyLoss does internally:**
->
+
+```mermaid
+flowchart LR
+    LOGITS["Raw Logits from model\ne.g. 2.1 and 0.4\ntwo numbers  any value"]
+    SOFTMAX["Softmax\ne^2.1 divided by e^2.1 plus e^0.4\n= 0.85 and 0.15\nnow sums to 1.0"]
+    LOOKUP["Look up true label\nlabel = 0  so use probability 0.85\nlabel = 1 would use 0.15"]
+    NEGLOG["Negative log of correct class prob\n-log 0.85 = 0.16  low loss  model was right\n-log 0.10 = 2.30  high loss  model was wrong"]
+    AVG["Average over all 64 sequences in batch\none scalar loss value"]
+    BACK["loss.backward\ngradient flows to every weight"]
+
+    LOGITS --> SOFTMAX --> LOOKUP --> NEGLOG --> AVG --> BACK
+
+    style LOGITS fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style SOFTMAX fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style LOOKUP fill:#f97316,stroke:#c2410c,color:#fff
+    style NEGLOG fill:#f97316,stroke:#c2410c,color:#fff
+    style AVG fill:#14b8a6,stroke:#0f766e,color:#fff
+    style BACK fill:#22c55e,stroke:#15803d,color:#fff
+```
+
 > 1. **Receive raw logits.** The model outputs raw unnormalized scores - e.g. `[2.1, 0.4]` for the two classes. These can be any numbers, positive or negative. They are called logits.
 >
 > 2. **Apply softmax to convert to probabilities.** Softmax divides each exponentiated score by the sum of all exponentiated scores: `e^2.1 / (e^2.1 + e^0.4) = 8.17 / (8.17 + 1.49) = 0.85`. Now the two numbers sum to 1.0 and can be interpreted as probabilities.
