@@ -57,6 +57,19 @@ Here is what that stacking looks like concretely using `["cat", "sat", "mat"]`:
 
 **Before any block** - each token is just its raw embedding. `"cat"` is a 64-dim vector that encodes "I am the word cat." It knows nothing about what surrounds it. `"sat"` knows nothing about `"cat"`. Each token is isolated.
 
+A 64-dim vector is literally just a list of 64 floating-point numbers. There is nothing symbolic about it - no slot labeled "noun-ness" or "position." The meaning is entirely in the pattern of the 64 values together, learned by the model during training:
+
+```
+"cat" embedding (64 numbers, shown truncated):
+[ 0.42, -0.18,  1.03,  0.07, -0.55,  0.31,  0.88, -0.22,
+  0.14,  0.66, -0.09,  0.41, -0.73,  0.52,  0.19, -0.38,
+  0.77,  0.03, -0.61,  0.28,  0.45, -0.14,  0.93, -0.07,
+  ...   (40 more numbers)   ...
+  0.11, -0.49,  0.35,  0.62, -0.26,  0.84, -0.17,  0.53 ]
+```
+
+You cannot read those numbers and know they mean "cat." The model discovered during training that this particular pattern of 64 values, when passed through the attention and FFN layers, produces correct predictions. Two tokens that the model treats as similar will have vectors whose dot product is high - not because any single number matches, but because the overall direction in 64-dimensional space is similar. `"cat"` and `"mat"` may end up with vectors that point in roughly similar directions (both are short nouns) while `"sat"` points in a very different direction (a verb). The geometry of the space encodes the relationships.
+
 **After Block 1** - self-attention has run once. Every token has now "looked at" every other token and updated its own vector. The new vector for `"cat"` is no longer just "I am cat" - it is "I am cat, and I appear right before the verb sat, and the sentence ends with mat which rhymes with me." `"sat"` now encodes "I am the verb, my subject is cat." The vectors carry context, not just identity.
 
 **After Block 2** - Block 2 receives those already-enriched vectors, not the raw embeddings. It now runs attention over representations that already contain context. `"cat"` no longer asks "which tokens are near me?" - it asks "which of these already-contextualized vectors are structurally similar to mine?" Block 2 can detect higher-order patterns: "cat and mat are both nouns that appear in subject and object positions" - something Block 1 could not see because Block 1 only had raw token identity to work with. Block 2 is reasoning about the patterns that Block 1 already found.
