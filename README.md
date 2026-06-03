@@ -506,6 +506,193 @@ flowchart TD
     style WO fill:#22c55e,stroke:#15803d,color:#fff
 ```
 
+---
+
+### What Each Head Actually Learns - Perspectives and Examples
+
+The four heads do not receive different inputs - they all start from the same token embeddings. What makes them different is that each head has its own independently trained Q, K, V weight matrices. Because the loss function only cares about the final classification, each head is free to discover whatever internal representation helps most. Training pressure naturally pushes them toward complementary roles, because if two heads learned identical patterns they would both occupy 16 dimensions of the output doing the same job - a waste the optimizer tends to avoid.
+
+Below are the four plausible specializations for this particular task (finding duplicate tokens in a sequence), along with a concrete worked example for the sentence-like token sequence `[7, 3, 11, 7, 5, 2]` where token `7` appears twice at positions 0 and 3.
+
+---
+
+#### Head 1 - Token Identity Matching
+
+**What it learns:** Q and K projections that produce high dot-product scores when two positions share the same token ID. It is essentially learning an embedding-space nearest-neighbor lookup.
+
+**Why this task rewards it:** The task is "does any token appear more than once?" A head that can spot exact repeats directly solves the problem. Training will push at least one head toward this because it is the most direct signal.
+
+**Worked example** - position 0 queries for matches:
+
+```
+Token sequence:   [  7,   3,  11,   7,   5,   2 ]
+Position:         [  0,   1,   2,   3,   4,   5 ]
+
+Head 1 raw scores (Q_0 · K_j):
+  pos 0 (tok=7):  +1.82   <- self, moderately high
+  pos 1 (tok=3):  -0.44   <- different token, low
+  pos 2 (tok=11): -0.71   <- different token, low
+  pos 3 (tok=7):  +2.31   <- SAME TOKEN - highest score
+  pos 4 (tok=5):  -0.38   <- different token, low
+  pos 5 (tok=2):  -0.52   <- different token, low
+
+After softmax:
+  pos 3 gets weight ~0.68  (model effectively "found" the duplicate)
+  all others share ~0.32
+```
+
+The attended output for position 0 now contains heavy information from position 3. After mean pooling, the classifier sees a signal that the sequence has a self-similar pair.
+
+---
+
+#### Head 2 - Positional Proximity
+
+**What it learns:** K projections that encode position, Q projections that look for nearby positions. This head tends to attend to the immediately preceding or following token - like a sliding window.
+
+**Why this task rewards it:** Positional context helps the model understand local structure. If a duplicate appears in adjacent positions (e.g. `[7, 7, 3, 5]`), a proximity head catches it trivially. It also provides the model with a sense of sequence order that pure token-identity matching ignores.
+
+**Worked example** - position 3 looks locally:
+
+```
+Head 2 attention weights for position 3 (tok=7):
+  pos 0:  0.04   <- far away
+  pos 1:  0.06   <- moderately far
+  pos 2:  0.41   <- adjacent left  <- high
+  pos 3:  0.31   <- self
+  pos 4:  0.16   <- adjacent right
+  pos 5:  0.02   <- far away
+
+This head sees: "what tokens immediately surround me?"
+It does NOT strongly find the tok=7 duplicate at pos 0.
+Head 1 covers that. These two heads are complementary.
+```
+
+> [!NOTE]
+> **Why multiple specializations matter.** If the duplicate tokens happen to be adjacent (positions 2 and 3), Head 2 (proximity) will detect it easily. If they are far apart (positions 0 and 5), Head 1 (identity) will detect it. Having both means the model is robust to where in the sequence the duplicate appears - a single head would have to trade off between the two strategies.
+
+---
+
+#### Head 3 - Co-occurrence and Repetition Detection
+
+**What it learns:** To recognize tokens that have appeared before in the same sequence - a form of "have I seen this before?" memory. Its K vectors learn to encode token frequency context, and its Q vectors learn to query for "is this a repeat?"
+
+**Why this task rewards it:** This is a higher-level version of Head 1. Where Head 1 fires on exact Q-K similarity between two positions, Head 3 learns to detect the pattern of repetition itself, not just match specific token IDs. It can generalize better across unseen token values.
+
+**Worked example** - position 3 checking for prior occurrences:
+
+```
+Token sequence:   [  7,   3,  11,   7,   5,   2 ]
+                               ^--- position 3
+
+Head 3 attention weights for position 3:
+  pos 0 (tok=7):  0.61   <- SAME token seen earlier  <- high
+  pos 1 (tok=3):  0.07
+  pos 2 (tok=11): 0.08
+  pos 3 (tok=7):  0.19   <- self
+  pos 4 (tok=5):  0.03
+  pos 5 (tok=2):  0.02
+
+Position 3 is "looking backward" to find where it has appeared before.
+The classifier gets a strong "this token is a repeat" signal.
+```
+
+---
+
+#### Head 4 - Fallback / Catch-all
+
+**What it learns:** A broad, distributed attention pattern - sometimes called "attention sink" behavior. It tends to spread weight roughly evenly or anchor heavily on position 0 or the last position.
+
+**Why this task rewards it:** No single head specialization covers every possible input pattern. Head 4 acts as a residual safety net. If Heads 1-3 all fire weakly on a particular input (e.g. a very short sequence where positional and identity signals are ambiguous), the even-spread attention from Head 4 still passes a usable average representation to the classifier. It also helps stabilize training early on before the other heads have found their specializations.
+
+**Worked example** - diffuse attention:
+
+```
+Head 4 attention weights for any position (typical pattern):
+  pos 0:  0.28   <- slight anchor on first token
+  pos 1:  0.14
+  pos 2:  0.16
+  pos 3:  0.17
+  pos 4:  0.13
+  pos 5:  0.12   <- slight anchor on last token
+
+No strong signal - but that is intentional.
+Head 4 ensures the output always contains a reasonable
+average of all tokens regardless of what Heads 1-3 decided.
+```
+
+---
+
+#### Putting All Four Heads Together - A Full Example
+
+For the sequence `[7, 3, 11, 7, 5, 2]`, here is what each head contributes to the final representation of **position 0** (the first `tok=7`) after the concat-and-project step:
+
+```
+Head 1 (identity):   strongly attended to pos 3 (tok=7)  -> "I have a duplicate"
+Head 2 (proximity):  attended to pos 1 (tok=3) nearby    -> "my neighbor is tok=3"
+Head 3 (repetition): low backward signal (pos 0 has no prior occurrences yet)
+Head 4 (fallback):   broad average of all positions       -> general context
+
+Concatenated 64-dim vector:
+[ H1_16dims | H2_16dims | H3_16dims | H4_16dims ]
+     ^            ^            ^           ^
+  "duplicate    "local       "seen       "average
+   found"       context"     before?"    context"
+
+W_O projects this to the final 64-dim context vector for pos 0.
+The classifier, after mean pooling over all positions, reads
+a strong "duplicate present" signal primarily from Head 1.
+```
+
+```mermaid
+flowchart LR
+    SEQ["Input seq\n7 3 11 7 5 2"]
+
+    H1R["Head 1\nIdentity match\npos 0 attends to pos 3\n0.68 weight on tok=7 match"]
+    H2R["Head 2\nProximity\npos 3 attends to pos 2\n0.41 weight on adjacent"]
+    H3R["Head 3\nRepetition\npos 3 attends to pos 0\n0.61 weight on prior occurrence"]
+    H4R["Head 4\nFallback\ndiffuse 0.28 0.14 0.16 0.17 0.13 0.12"]
+
+    CATR["Concat\n64 dims"]
+    WOR["W_O projection\nlearned blend"]
+    OUT["Context vector\nfor each position\nDuplicate signal strong"]
+    CLS["Classifier\nLabel=1 duplicate found"]
+
+    SEQ --> H1R
+    SEQ --> H2R
+    SEQ --> H3R
+    SEQ --> H4R
+    H1R --> CATR
+    H2R --> CATR
+    H3R --> CATR
+    H4R --> CATR
+    CATR --> WOR --> OUT --> CLS
+
+    style SEQ fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style H1R fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style H2R fill:#a855f7,stroke:#7e22ce,color:#fff
+    style H3R fill:#6366f1,stroke:#4338ca,color:#fff
+    style H4R fill:#ec4899,stroke:#be185d,color:#fff
+    style CATR fill:#f97316,stroke:#c2410c,color:#fff
+    style WOR fill:#14b8a6,stroke:#0f766e,color:#fff
+    style OUT fill:#22c55e,stroke:#15803d,color:#fff
+    style CLS fill:#15803d,stroke:#166534,color:#fff
+```
+
+| # | <sub>Head</sub> | <sub>Specialization</sub> | <sub>Attends strongly to</sub> | <sub>Signal it adds to classifier</sub> | <sub>Covers duplicate case</sub> |
+|---|---|---|---|---|---|
+| 1 | <sub>Head 1</sub> | <sub>Token identity match</sub> | <sub>Positions with same token ID</sub> | <sub>"This token has an exact copy"</sub> | <sub>Any distance between duplicates</sub> |
+| 2 | <sub>Head 2</sub> | <sub>Positional proximity</sub> | <sub>Adjacent positions</sub> | <sub>"What is around me locally"</sub> | <sub>Adjacent duplicates especially</sub> |
+| 3 | <sub>Head 3</sub> | <sub>Repetition / prior occurrence</sub> | <sub>Earlier positions with same token</sub> | <sub>"I have appeared before"</sub> | <sub>Backward-looking duplicates</sub> |
+| 4 | <sub>Head 4</sub> | <sub>Fallback average</sub> | <sub>Broadly distributed</sub> | <sub>"General average context"</sub> | <sub>Stabilizes all cases</sub> |
+
+> [!IMPORTANT]
+> These specializations are **emergent** - they are not programmed in. The model discovers them purely from gradient descent on the classification loss. Different random seeds may assign the roles differently across heads. What matters is that the combination of four heads together is more powerful than any single head alone, and the W_O projection learns to assemble their contributions into the best possible context representation.
+
+> [!TIP]
+> To actually observe what your trained model's heads learned, run `python src/main.py visualize`. The attention heatmap images saved to `artifacts/` show the real learned attention weights. Compare Head 0 vs Head 1 vs Head 2 vs Head 3 in `attention_layer0.png` - you should see at least one head that lights up strongly on position pairs where tokens match.
+
+---
+
 ### How to Read an Attention Map
 
 An attention map is a `(seq_len, seq_len)` grid where cell `[i, j]` holds the weight that token position $i$ places on token position $j$ when computing its new representation. All values in a row sum to 1.0 because they come from a softmax. A bright cell means the model is drawing heavily from that source token. The diagram below shows what a well-trained attention map row might look like for position 0 in a sequence where `tokens[0] == tokens[5] == 7`.
