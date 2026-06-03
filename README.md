@@ -402,6 +402,66 @@ Single-head attention runs the scaled dot-product attention once over the full `
 > [!NOTE]
 > **Single-head vs Multi-head - why does it matter?** A single attention head must simultaneously represent all types of relationships a token has with others using one shared set of projections. Multi-head attention gives each head its own independent projections, so Head 1 might learn to match token values (exactly what this task needs), Head 2 might track positional proximity, Head 3 might detect repetition, and Head 4 might learn a fallback catch-all pattern. The heads run in parallel and are cheap because each one works in a smaller `head_dim`-dimensional space rather than the full `embed_dim` space.
 
+> [!NOTE]
+> **How do the heads "vote" on context - how does the output get combined?**
+>
+> The heads do not vote like a committee where the majority wins. Instead they **contribute different information to different dimensions of the same output vector**, and a learned linear layer decides how to weight and blend those contributions. Here is the exact mechanism step by step:
+>
+> **Step 1 - Each head produces its own attended output independently.**
+> Every head runs its own scaled dot-product attention in a 16-dimensional subspace and produces a result of shape `(batch, seq, 16)`. The four heads run in parallel with no communication between them.
+>
+> ```
+> Head 1 output:  [0.82, -0.31, 1.20, 0.05, ...]   shape (batch, seq, 16)
+> Head 2 output:  [0.44,  0.71, -0.55, 0.38, ...]  shape (batch, seq, 16)
+> Head 3 output:  [-0.12, 0.93,  0.28, -0.60, ...]  shape (batch, seq, 16)
+> Head 4 output:  [0.61, -0.44,  0.17,  0.80, ...]  shape (batch, seq, 16)
+> ```
+>
+> **Step 2 - Concatenate all heads into one wide vector.**
+> The four 16-dimensional outputs are concatenated side by side, producing a single `(batch, seq, 64)` tensor. No information is lost or merged yet - the four blocks of 16 dimensions sit next to each other.
+>
+> ```
+> Concatenated:  [0.82, -0.31, 1.20, 0.05, ... | 0.44, 0.71, -0.55, 0.38, ... | ...]
+>                 <--- Head 1: 16 dims --->       <--- Head 2: 16 dims --->
+>                 shape: (batch, seq, 64)
+> ```
+>
+> **Step 3 - The output projection W_O blends everything.**
+> The concatenated 64-dimensional vector is passed through a final linear layer `W_O` of shape `(64, 64)`. This is a full matrix multiply - every output dimension can draw from every input dimension across all heads. This is where the actual "combining opinions" happens. `W_O` is learned during training, so it learns which head's information matters for which output dimension.
+>
+> ```
+> Final output = Concat([H1, H2, H3, H4]) @ W_O    shape: (batch, seq, 64)
+> ```
+>
+> **Concrete analogy.** Imagine four reviewers each reading the same document and highlighting different things: one marks character names, one marks dates, one marks locations, one marks emotions. They hand their highlighted copies to an editor (W_O) who reads all four simultaneously and writes a single synthesis. The editor decides how much weight to give each reviewer's highlights when composing the final summary. That synthesis is what gets passed to the next encoder block.
+>
+> **Why this is better than averaging.** If you averaged the four head outputs instead of concatenating and projecting, you would mix information from all four heads uniformly and permanently - the model could not learn to use Head 1's information for one part of the representation and Head 2's for another. The concat-then-project design preserves all 64 dimensions and gives `W_O` the freedom to route each head's signal to exactly where it is most useful.
+
+```mermaid
+flowchart LR
+    H1O["Head 1 output\n16 dims\ntoken identity signal"]
+    H2O["Head 2 output\n16 dims\nposition signal"]
+    H3O["Head 3 output\n16 dims\nco-occurrence signal"]
+    H4O["Head 4 output\n16 dims\nother signal"]
+    CAT["Concatenate\n64 dims total\nall information preserved"]
+    WO["Output projection W_O\n64x64 learned matrix\nroutes each head signal\nto the right output dims"]
+    FOUT["Final output\n64 dims\nblended context vector"]
+
+    H1O --> CAT
+    H2O --> CAT
+    H3O --> CAT
+    H4O --> CAT
+    CAT --> WO --> FOUT
+
+    style H1O fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style H2O fill:#a855f7,stroke:#7e22ce,color:#fff
+    style H3O fill:#6366f1,stroke:#4338ca,color:#fff
+    style H4O fill:#ec4899,stroke:#be185d,color:#fff
+    style CAT fill:#f97316,stroke:#c2410c,color:#fff
+    style WO fill:#14b8a6,stroke:#0f766e,color:#fff
+    style FOUT fill:#22c55e,stroke:#15803d,color:#fff
+```
+
 ```mermaid
 flowchart TD
     subgraph SINGLE["Single-Head  one projection over full dim=64"]
