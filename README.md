@@ -57,6 +57,53 @@ Traditional sequence models like RNNs and CNNs process tokens either one at a ti
 > The table above is why the baseline struggles on the endpoint equality task. After mean pooling, position 0 and position 15 are indistinguishable from any other position - the model cannot tell them apart to compare their token IDs.
 
 > [!NOTE]
+> **What is a "signal" in this context?**
+>
+> A signal is information that travels through the model and influences its output. Think of it like a telephone game. Token 1 has information ("I am token ID 7"). To share that information with token 15, it must pass through the model's processing steps. In an RNN, the signal hops from position 1 to position 2 to position 3, and so on - each hop is one step. By the time it reaches position 15, it has been through 14 transformations and the original "I am token 7" message has been diluted or distorted by all the intermediate steps. This is called the **vanishing gradient problem** - not only does the information fade, but the training signal (the gradient that tells the model how to fix its mistakes) also fades over many steps, making it nearly impossible to learn long-range patterns. Self-attention skips all the intermediate hops entirely - token 0 and token 15 compute a direct score with each other in a single operation, so the signal travels in one step regardless of distance.
+
+> [!NOTE]
+> **What is a "step" in an RNN?**
+>
+> In an RNN (Recurrent Neural Network), a "step" is one position in the sequence being processed. The model reads token 0 and produces a hidden state (a vector summarizing everything seen so far). Then it reads token 1 and updates the hidden state. Then token 2, and so on. Each update is one step. A sequence of length 16 requires 16 steps. The problem is that each step applies the same weight matrix to the current hidden state, which means the hidden state is repeatedly multiplied by the same numbers. Mathematically, multiplying a vector by the same matrix over and over causes the values to either shrink toward zero (vanish) or grow toward infinity (explode), depending on the matrix. After 14 steps, the hidden state retains very little of what it saw at step 0. This is structurally different from attention, which never applies a repeated chain of multiplications - every token directly scores every other token without any intermediate steps in between.
+>
+> ```
+> RNN information flow (16 steps):
+> tok[0] -> h1 -> h2 -> h3 -> h4 -> h5 -> h6 -> ... -> h15
+>   ^                                                     ^
+>   original "token 7" signal                     14 transformations later
+>   is mostly gone by here                         only faint echo remains
+>
+> Attention information flow (1 step):
+> tok[0] ---scores directly---> tok[15]
+>   ^                              ^
+>   no intermediate steps          full signal, no dilution
+> ```
+
+> [!NOTE]
+> **What is an MLP?**
+>
+> MLP stands for Multi-Layer Perceptron - the most basic type of neural network, also called a "fully connected network" or "dense network." It is a sequence of linear layers (matrix multiplications) with nonlinear activation functions in between. Each layer takes a vector of numbers as input and produces a new vector of numbers as output, where every input number can contribute to every output number.
+>
+> In this project, two things are called MLPs:
+>
+> - **The baseline model's "MLP on mean-pooled embeddings"** - the entire baseline classifier is just an MLP applied to the average of all token embeddings. It has no attention, no ability to look at specific positions, and no way to compare individual tokens to each other. It sees only the average.
+>
+> - **The feed-forward network (FFN) inside each encoder block** - this is also an MLP, but a small one applied per-token after attention. It has two linear layers: `Linear(64 -> 128) -> ReLU -> Dropout -> Linear(128 -> 64)`.
+>
+> ```
+> A 2-layer MLP (what the baseline uses for classification):
+>
+>  Input vector          Hidden layer              Output
+>  [v0, v1, ..., v63]  ->  Linear(64,64)  ->  ReLU  ->  Linear(64,2)  ->  [logit_0, logit_1]
+>       64 numbers              64 numbers                                   2 numbers (class scores)
+>
+> Every input number is connected to every hidden number (that is what "fully connected" means).
+> The weights of those connections are what get learned during training.
+> ```
+>
+> The key limitation of an MLP for sequence tasks is that it requires a fixed-size input vector. That is why mean pooling happens first - it collapses the variable-length sequence into one fixed-size vector before the MLP can process it. The collapsing is exactly where positional information is lost.
+
+> [!NOTE]
 > **What does "pairwise score between every token and every other token" mean?**
 >
 > Take a 5-token sentence: `["The", "cat", "sat", "on", "mat"]`. A *pairwise* score means we compute one score for every possible ordered pair of positions - that is 5 x 5 = 25 scores total. Each score answers one specific question: *"when building token i's new representation, how much should it draw from token j?"*
@@ -490,6 +537,35 @@ Single-head attention runs the scaled dot-product attention once over the full `
 >
 > **Why passing it to the next block matters.** Each encoder block takes the output of the previous block as its input - so the second block does not see the original raw token embeddings, it sees the already-enriched context vectors that the first block produced. This means Block 2's attention heads are not asking "which raw token IDs are similar?" - they are asking "which already-contextualized representations are similar?" The model builds understanding in layers. Block 1 might learn low-level patterns (token identity, proximity). Block 2 receives those patterns baked into the vectors and can detect higher-level structure on top of them - like noticing that two positions both have the "this token appeared elsewhere" signal from Block 1, and amplifying that into a stronger classification signal. Without stacking blocks, the model is limited to one round of cross-token communication. Each additional block is another full round where every token can update its representation based on what all other tokens now look like after the previous round.
 >
+> **What would Block 3, 4, 5 and deeper blocks do?**
+>
+> This project uses only 2 blocks because the task is simple enough to solve in 2 rounds of attention. But the pattern continues upward and is visible in real-world models like BERT (12 blocks) and GPT-2 (24 blocks). Here is what each additional depth level tends to learn, using the endpoint equality task as the anchor example:
+>
+> **Block 1 - surface matching.** The raw token embeddings are still close to their initialized values. Block 1 heads learn basic relationships: "token 7 at position 0 looks similar to token 7 at position 3" (identity), "position 4 is next to position 5" (proximity). The output vectors are slightly enriched - each token now knows something about its immediate neighborhood. In real NLP, Block 1 typically learns part-of-speech-like patterns: "this word tends to follow a noun" or "this word is usually a verb."
+>
+> **Block 2 - patterns of surface patterns.** Block 2 receives vectors that already encode "I have a nearby match" or "I am isolated." It can now ask higher-level questions: "do BOTH position 0 AND position 15 have the same match signal?" rather than "do they share a token ID?" This is one level of abstraction higher. In real NLP, Block 2 tends to learn phrase-level patterns: "noun-verb agreement," "adjective modifies the next noun."
+>
+> **Block 3 - relationship chains.** Block 3 operates on vectors that already encode pairwise match and co-occurrence structure. It can now detect that the match signal at position 0 and the match signal at position 15 are correlated - which is exactly the classification criterion. In real NLP, Block 3 often encodes clause-level structure: "this is the subject of the main verb."
+>
+> **Blocks 4-6 - compositional structure.** Each block can attend over the representations produced by the previous one, building larger and larger compositional structures. By Block 6 in BERT, tokens encode sentence-level roles. In a deeper model on a harder task (e.g. "do token[0] and token[15] both appear at least twice elsewhere in the sequence?"), you would genuinely need 4-6 blocks to encode that chain of reasoning.
+>
+> **Blocks 7-12 (BERT depth) - task-specific abstraction.** In real language models, mid-depth blocks encode semantic relationships ("this pronoun refers to that noun phrase four tokens back"). Attention weights in these blocks often look almost random to human eyes - they are capturing abstract semantic proximity that no longer maps cleanly to surface-level token similarity.
+>
+> **Blocks 13-24 (GPT-2 depth) - output preparation.** The deepest blocks in very large models appear to shift from building representations to preparing the output. In GPT-2, the last few blocks are essentially "formatting" the representation for the final classification or next-token prediction, undoing some of the abstraction from mid-depth blocks to produce a form the linear head can act on.
+>
+> **For this project's task, 2 blocks is optimal.** Block 1 finds the candidate matches. Block 2 confirms that the endpoints are the ones that matched and suppresses false positives. A third block would have little new information to work with and would just add noise and parameters with no accuracy gain.
+
+#### Encoder Block Depth - What Each Layer Level Learns
+
+| # | <sub>Block depth</sub> | <sub>Input to this block</sub> | <sub>Typical patterns learned</sub> | <sub>Real NLP analogy</sub> | <sub>Needed for this task?</sub> |
+|---|---|---|---|---|---|
+| 1 | <sub>Block 1</sub> | <sub>Raw token + position embeddings</sub> | <sub>Token identity matches, positional neighbors, direct co-occurrence</sub> | <sub>Part-of-speech, capitalization, character n-grams</sub> | <sub>Yes - finds the candidate duplicate pairs</sub> |
+| 2 | <sub>Block 2</sub> | <sub>Block 1 output - "who is similar to who"</sub> | <sub>Patterns of matches - are both endpoints marked as duplicates?</sub> | <sub>Phrase structure, noun-verb agreement, local dependency</sub> | <sub>Yes - confirms endpoints are the matching pair</sub> |
+| 3 | <sub>Block 3</sub> | <sub>Block 2 output - "which pairs are confirmed"</sub> | <sub>Relationship chains across confirmed pairs</sub> | <sub>Clause structure, subject-object relations</sub> | <sub>Not needed for this task - diminishing returns</sub> |
+| 4 | <sub>Blocks 4-6</sub> | <sub>Compositional structure from Block 3</sub> | <sub>Larger compositional groupings, nested relationships</sub> | <sub>Sentence-level roles, coreference chains</sub> | <sub>Only if task required multi-step reasoning chains</sub> |
+| 5 | <sub>Blocks 7-12</sub> | <sub>Clause-level representations</sub> | <sub>Abstract semantic proximity, discourse-level patterns</sub> | <sub>"This pronoun refers to that noun 8 tokens back"</sub> | <sub>Only for real language tasks with complex semantics</sub> |
+| 6 | <sub>Blocks 13-24</sub> | <sub>Semantic representations</sub> | <sub>Output preparation - reformatting for the classifier head</sub> | <sub>Task-specific prediction formatting</sub> | <sub>Only in very large models on very complex tasks</sub> |
+>
 > **Why this is better than averaging - and no, single-head does not average either.** Single-head attention does not average the head outputs - there is only one head, so there is nothing to combine. What single-head does instead is run the full scaled dot-product attention once over the entire 64-dimensional space in one shot, producing a single 64-dim attended output directly. The averaging comparison is about a hypothetical bad design where you replace the concat-then-project step with a simple mean across the four head outputs. That bad design would produce `(H1 + H2 + H3 + H4) / 4` - a 16-dim vector where every head contributed exactly 25% to every output dimension, with no learned routing. The actual multi-head design instead places all four 16-dim outputs side by side (preserving all 64 dimensions separately) and then lets W_O - a full 64x64 matrix - decide how to blend them. W_O can put 80% of Head 1's signal into the first 20 output dimensions and nearly zero elsewhere, while simultaneously routing Head 2's signal heavily into a different set of dimensions. That selective routing is what makes multi-head strictly more expressive than either single-head or a naive average.
 
 ```mermaid
@@ -792,6 +868,21 @@ flowchart LR
 > [!NOTE]
 > Each encoder layer produces one attention map per head, so with `num_layers=2` and `num_heads=4` you get 8 attention maps total per input sample. The visualize command saves them as a grid image per layer. Look for heads where the top-left to bottom-right diagonal is bright (self-attention is high) and where positions 0 and 15 have strong mutual attention - those are the heads that learned to solve the task.
 
+#### Attention Map Pattern Guide
+
+When you open the saved heatmap images, each cell `[i, j]` is a color from dark (near 0) to bright (near 1). The table below lists every common pattern shape, what it means mechanically, and whether it is a sign of a healthy or poorly trained head.
+
+| # | <sub>Pattern name</sub> | <sub>What it looks like in the grid</sub> | <sub>Mechanical meaning</sub> | <sub>Healthy or concerning?</sub> | <sub>Example in this task</sub> |
+|---|---|---|---|---|---|
+| 1 | <sub>Diagonal bright band</sub> | <sub>Bright cells running top-left to bottom-right</sub> | <sub>Every token attends mostly to itself - low information exchange</sub> | <sub>Concerning in early layers; Head 4 fallback may show this</sub> | <sub>Head attending to self only - not solving the task</sub> |
+| 2 | <sub>Column spike</sub> | <sub>One entire column is bright, rest dark</sub> | <sub>All tokens attend to one specific position - that position is a strong anchor</sub> | <sub>Healthy if the anchor is position 0 or 15 (the endpoints)</sub> | <sub>All tokens checking: "what is token[0]?"</sub> |
+| 3 | <sub>Row spike</sub> | <sub>One entire row is bright, rest dark</sub> | <sub>One specific token position attends broadly to everything - it is "summarizing"</sub> | <sub>Healthy for the aggregating token before mean pool</sub> | <sub>Position 0 scanning all others looking for a match</sub> |
+| 4 | <sub>Off-diagonal bright spots</sub> | <sub>Bright cells at non-diagonal positions, e.g. [0,15] and [15,0]</sub> | <sub>Specific token pairs have learned mutual high attention</sub> | <sub>Very healthy - this is the task-solving pattern for endpoint equality</sub> | <sub>[0,15] bright = position 0 attending strongly to position 15</sub> |
+| 5 | <sub>Uniform gray</sub> | <sub>All cells roughly the same mid-level brightness</sub> | <sub>Attention is diffuse - no strong preference anywhere</sub> | <sub>Normal for Head 4 fallback; concerning if all heads look like this</sub> | <sub>Head 4 catch-all pattern - provides stable average context</sub> |
+| 6 | <sub>Lower triangle bright</sub> | <sub>Cells below the diagonal are brighter than above</sub> | <sub>Tokens attend to earlier positions more than later ones</sub> | <sub>Healthy for Head 3 repetition detection - looking backward</sub> | <sub>Position 3 (second tok=7) looking back at position 0 (first tok=7)</sub> |
+| 7 | <sub>Near-diagonal band</sub> | <sub>Bright band 1-2 cells away from the main diagonal</sub> | <sub>Every token attends mostly to its immediate neighbors</sub> | <sub>Healthy for Head 2 proximity - local context window behavior</sub> | <sub>Head 2 tracking "what tokens are next to me"</sub> |
+| 8 | <sub>Single saturated cell</sub> | <sub>One cell is 1.0, all others in the row are 0.0</sub> | <sub>Softmax has saturated - model is 100% certain about one source</sub> | <sub>Concerning - means gradient flow to all other positions is zero</sub> | <sub>Symptom of missing scaling by sqrt(d_k)</sub> |
+
 ---
 
 ## Where Does the Data Come From? How Does the Model Know Anything?
@@ -905,6 +996,19 @@ Input token at position 0, value 7:
   combined input vector = [0.57,  0.57,  0.47, ...]   <- fed into encoder block
 ```
 
+#### What the Two Embedding Tables Encode
+
+Both tables start as random noise and are trained jointly with the rest of the model. After training they encode very different types of information. The table below contrasts what each embedding type captures, what happens if you remove it, and what you would observe in the attention maps.
+
+| # | <sub>Embedding type</sub> | <sub>Shape</sub> | <sub>Indexed by</sub> | <sub>Encodes after training</sub> | <sub>Effect if removed</sub> | <sub>Observable in attention maps?</sub> |
+|---|---|---|---|---|---|---|
+| 1 | <sub>Token embedding</sub> | <sub>(20, 64)</sub> | <sub>Token ID (0-19)</sub> | <sub>Meaning of each token - similar tokens cluster in 64-dim space</sub> | <sub>Model loses ability to distinguish token identities - all tokens look the same</sub> | <sub>Yes - Head 1 identity-match pattern disappears; off-diagonal bright spots vanish</sub> |
+| 2 | <sub>Positional embedding</sub> | <sub>(16, 64)</sub> | <sub>Sequence position (0-15)</sub> | <sub>Location in the sequence - position 0 and 15 get distinct "endpoint" representations</sub> | <sub>Model cannot tell position 0 from position 7; mean pooling has no position signal to work with</sub> | <sub>Yes - column-spike patterns anchored to endpoints disappear; all positions become interchangeable</sub> |
+| 3 | <sub>Sum of both</sub> | <sub>(batch, seq, 64)</sub> | <sub>Token ID + position together</sub> | <sub>"Token 7 at position 0" vs "token 7 at position 8" become different 64-dim vectors</sub> | <sub>N/A - this is the actual input used</sub> | <sub>N/A</sub> |
+
+> [!NOTE]
+> The fact that token and positional embeddings are simply **added** (not concatenated) means both must live in the same 64-dimensional space and their signals must not cancel each other out. This works because the model learns the two tables jointly - the token embedding for ID 7 will shift to be orthogonal to the positional embeddings of the positions where it most needs to be distinguishable. Addition is cheaper than concatenation (no extra dimensions), which is why the original "Attention Is All You Need" paper used it.
+
 ---
 
 ### Comparison to GPT / BERT / LLMs
@@ -953,6 +1057,23 @@ flowchart LR
 
 > [!TIP]
 > Run `python src/main.py train` to watch the weights being learned from nothing. The loss printed each epoch drops as the model figures out the endpoint equality pattern. The final weights saved to `artifacts/transformer.pt` are the result of that entire learning process - nothing was loaded from outside.
+
+#### Training Loss Curve Interpretation
+
+When you run `python src/main.py visualize`, the file `artifacts/training_comparison.png` shows the loss and accuracy curves per epoch. Knowing how to read these curves tells you whether training went well, whether you should train longer, and whether something went wrong. The table below covers every common pattern.
+
+| # | <sub>Loss curve shape</sub> | <sub>Train loss</sub> | <sub>Val loss</sub> | <sub>What it means</sub> | <sub>What to do</sub> |
+|---|---|---|---|---|---|
+| 1 | <sub>Both drop together, converge near same value</sub> | <sub>Decreasing</sub> | <sub>Decreasing, tracks train</sub> | <sub>Healthy training - model is generalizing, not memorizing</sub> | <sub>Nothing - this is the ideal outcome</sub> |
+| 2 | <sub>Train drops, val stays flat or rises</sub> | <sub>Decreasing</sub> | <sub>Flat or increasing</sub> | <sub>Overfitting - model memorizes training sequences instead of learning the pattern</sub> | <sub>Reduce epochs, increase dropout, reduce embed-dim or num-layers</sub> |
+| 3 | <sub>Both curves barely move after epoch 1</sub> | <sub>Near-flat from epoch 1</sub> | <sub>Near-flat</sub> | <sub>Underfitting - learning rate too low, or model too small to represent the task</sub> | <sub>Increase learning rate (try 3e-3), increase embed-dim or num-layers</sub> |
+| 4 | <sub>Loss spikes upward mid-training then recovers</sub> | <sub>Spike then drops</sub> | <sub>Spike then drops</sub> | <sub>Learning rate too high causing a bad weight update that the optimizer recovers from</sub> | <sub>Lower learning rate; add gradient clipping</sub> |
+| 5 | <sub>Loss diverges to NaN or very large values</sub> | <sub>Rapidly increasing to NaN</sub> | <sub>NaN</sub> | <sub>Numerical instability - probably missing sqrt(d_k) scaling or lr far too high</sub> | <sub>Check attention scaling; reduce lr by 10x; check for zero division in LayerNorm</sub> |
+| 6 | <sub>Transformer and baseline curves nearly identical</sub> | <sub>Both ~same</sub> | <sub>Both ~same</sub> | <sub>Attention is not activating - model is not using its attention heads</sub> | <sub>Check that attention dropout is not set to 1.0; check W_Q/W_K init</sub> |
+| 7 | <sub>Accuracy plateaus around 95% but loss still drops</sub> | <sub>Still decreasing</sub> | <sub>~flat accuracy</sub> | <sub>Normal - accuracy saturates before loss because accuracy is discrete (right/wrong) while loss is continuous</sub> | <sub>Nothing - model is fine-tuning its confidence, not making new errors</sub> |
+
+> [!TIP]
+> The most useful thing to look at is the **gap between train and val loss**. A small gap (< 0.05) means healthy generalization. A large and growing gap means overfitting. If both curves are flat from the start, try increasing the learning rate by 3-10x first before changing model size.
 
 ---
 
@@ -1148,6 +1269,23 @@ The table below summarizes the design differences between the two models. The ex
 
 > [!NOTE]
 > The baseline model hovers near chance on this task because mean pooling destroys all positional structure. After averaging embeddings, no information remains about which tokens were at the first or last position. This is exactly the failure mode that positional attention was designed to address.
+
+---
+
+#### What to Try - Experiment Variations and Expected Outcomes
+
+This table is a guided experiment menu. Each row is a single config change you can make to the `train` command, what you should observe, and what it teaches about the architecture.
+
+| # | <sub>Change to make</sub> | <sub>Command example</sub> | <sub>Expected change in accuracy</sub> | <sub>Expected change in attention maps</sub> | <sub>What you learn</sub> |
+|---|---|---|---|---|---|
+| 1 | <sub>Set `--num-heads 1`</sub> | <sub>`python -m src.main train --num-heads 1`</sub> | <sub>Slight drop (~90-93%) - one head must learn all patterns at once</sub> | <sub>One 64-dim attention map per layer instead of 4; likely shows identity-match pattern only</sub> | <sub>Multi-head specialization is real - one head cannot be both identity-matcher and proximity-tracker</sub> |
+| 2 | <sub>Set `--num-layers 1`</sub> | <sub>`python -m src.main train --num-layers 1`</sub> | <sub>Moderate drop (~85-90%) - one round of attention</sub> | <sub>Layer 0 maps show stronger off-diagonal patterns; no Layer 1 maps</sub> | <sub>Block stacking matters - one round of attention is insufficient for robust endpoint comparison</sub> |
+| 3 | <sub>Set `--seq-len 32`</sub> | <sub>`python -m src.main train --seq-len 32`</sub> | <sub>Drop to ~85-92% - longer range is harder</sub> | <sub>Off-diagonal bright spots at [0,31] instead of [0,15]; harder to find visually</sub> | <sub>Distance between endpoints directly increases task difficulty for all models</sub> |
+| 4 | <sub>Set `--vocab-size 5`</sub> | <sub>`python -m src.main train --vocab-size 5`</sub> | <sub>Lower accuracy (~80-85%) - 20% chance of random match makes it hard to distinguish true from false positives</sub> | <sub>More diffuse attention - many positions look like potential matches</sub> | <sub>Class imbalance and high base rate make the task harder even though the rule is the same</sub> |
+| 5 | <sub>Set `--dropout 0.0`</sub> | <sub>`python -m src.main train --dropout 0.0`</sub> | <sub>Similar or slightly higher train accuracy; val accuracy may drop</sub> | <sub>Sharper, more saturated attention maps - less spread</sub> | <sub>Dropout acts as regularization - removing it can overfit on small datasets</sub> |
+| 6 | <sub>Set `--embed-dim 16 --num-heads 2`</sub> | <sub>`python -m src.main train --embed-dim 16 --num-heads 2`</sub> | <sub>Drop to ~80-88% - model is capacity-constrained</sub> | <sub>Less distinct head specialization visible</sub> | <sub>embed-dim sets the representation bottleneck; too small and the model cannot separate token identities</sub> |
+| 7 | <sub>Set `--epochs 50`</sub> | <sub>`python -m src.main train --epochs 50`</sub> | <sub>Marginal improvement or no change after epoch ~15</sub> | <sub>Attention maps look similar to 15-epoch version</sub> | <sub>This task converges fast - more epochs does not help once the pattern is found</sub> |
+| 8 | <sub>Compare baseline directly</sub> | <sub>Baseline runs automatically alongside transformer</sub> | <sub>Baseline stays at ~55-65% regardless of epochs</sub> | <sub>No attention maps for baseline</sub> | <sub>Without attention, no configuration of MLP-on-pooled-embeddings can solve a pure positional task</sub> |
 
 ---
 
