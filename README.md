@@ -108,18 +108,20 @@ Traditional sequence models like RNNs and CNNs process tokens either one at a ti
 >
 > Both are learned transformations that take a vector (or set of vectors) as input and produce a new vector as output. The critical difference is *what information each operation is allowed to look at* when computing each output value.
 >
-> An MLP processes one fixed vector at a time. Every output number is a learned blend of every input number - but the blend is the same no matter what the input values are. The weights are fixed after training. If token 0 is a 7 and token 15 is also a 7, the MLP has no way to "notice" that match because it only ever sees the mean of all 16 tokens, not the individual values.
+> An MLP processes one **fixed-size input vector** (a single list of numbers with a length that never changes - in this project, always exactly 64 numbers after mean pooling) at a time. Every output number is a learned blend of every input number - but the blend is the same no matter what the input values are. The weights are fixed after training. If token 0 is a 7 and token 15 is also a 7, the MLP has no way to "notice" that match because it only ever sees the mean of all 16 tokens, not the individual values.
 >
-> Self-attention processes the entire sequence at once and computes its mixing weights *dynamically based on the input content*. The Q dot K scores change for every new sequence, because Q and K are functions of the token values themselves. If token 0 and token 15 both embed to similar vectors, their dot product is high, so token 0's updated representation draws heavily from token 15 - and vice versa. The attention pattern adapts to each individual input.
+> Self-attention processes the entire sequence at once and computes its mixing weights *dynamically based on the **input content*** (meaning: the actual numeric values of the tokens in this specific sequence - not a fixed rule, but a calculation that runs fresh for each new input). The Q dot K scores change for every new sequence, because Q and K are functions of the token values themselves. What does that accomplish? It means the model can route information differently depending on what the tokens actually are. For sequence A where token 0 and token 15 are both `7`, attention fires a strong connection between them. For sequence B where token 0 is `3` and token 15 is `12`, that same connection is weak. The MLP applies the same transformation to both sequences because it only sees the average - it cannot tell the difference between a sequence where the endpoints match and one where they do not.
+>
+> **Positional information** means: which slot in the sequence a token occupies - slot 0, slot 1, ... slot 15. When you mean-pool a sequence (add all 16 token vectors and divide by 16), the result is the same regardless of whether token `7` was at position 0 or position 8. The position is gone. Self-attention preserves position because each token carries a positional embedding (a learned vector added at the start that encodes "I am at slot 0" or "I am at slot 15") and attention can learn to look specifically at the slot-0 and slot-15 vectors by name.
 >
 > | # | <sub>Property</sub> | <sub>MLP (baseline)</sub> | <sub>Self-Attention</sub> |
 > |---|---|---|---|
-> | 1 | <sub>Input shape</sub> | <sub>One fixed-size vector (after mean pooling)</sub> | <sub>Full sequence - all positions simultaneously</sub> |
-> | 2 | <sub>Mixing weights</sub> | <sub>Fixed after training - same blend for every input</sub> | <sub>Computed from Q dot K - changes for every new input</sub> |
-> | 3 | <sub>Positional awareness</sub> | <sub>None - mean pooling discards all position information</sub> | <sub>Full - each position attends to specific other positions</sub> |
+> | 1 | <sub>Input shape</sub> | <sub>One fixed-size vector (always 64 numbers, after mean pooling)</sub> | <sub>Full sequence - all 16 positions simultaneously, each a 64-dim vector</sub> |
+> | 2 | <sub>Mixing weights</sub> | <sub>Fixed after training - same blend for every input</sub> | <sub>Computed from Q dot K on each new input - different weights for every sequence</sub> |
+> | 3 | <sub>Positional awareness</sub> | <sub>None - mean pooling discards which slot each token was in</sub> | <sub>Full - each position attends to specific other positions by slot number</sub> |
 > | 4 | <sub>Can compare token 0 to token 15?</sub> | <sub>No - both are averaged away before processing</sub> | <sub>Yes - Q at position 0 can attend strongly to K at position 15</sub> |
-> | 5 | <sub>Output depends on input content?</sub> | <sub>No - same weight matrix applied regardless</sub> | <sub>Yes - attention scores are a function of the actual token values</sub> |
-> | 6 | <sub>Where positional info is lost</sub> | <sub>At mean pooling, before the MLP even runs</sub> | <sub>Never lost - position embeddings are added and carried through</sub> |
+> | 5 | <sub>Output depends on input content?</sub> | <sub>No - same weight matrix applied regardless of what the tokens are</sub> | <sub>Yes - attention scores are recomputed from the actual token values each time</sub> |
+> | 6 | <sub>Where positional info is lost</sub> | <sub>At mean pooling, before the MLP even runs</sub> | <sub>Never lost - position embeddings are added and carried through all blocks</sub> |
 > | 7 | <sub>Computation cost</sub> | <sub>O(seq) - linear in sequence length</sub> | <sub>O(seq squared) - every pair of positions is scored</sub> |
 > | 8 | <sub>Role in this project</sub> | <sub>Entire baseline model - no attention at all</sub> | <sub>Core of each encoder block - runs before the per-token FFN/MLP</sub> |
 >
@@ -166,7 +168,78 @@ The scaling factor $\frac{1}{\sqrt{d_k}}$ in the attention formula is one of the
 >
 > **Problem 3 - why low scores disappear fastest under softmax saturation.** The softmax function is $e^{x_i} / \sum_j e^{x_j}$. When one score is much larger than the others, its exponential dominates the denominator. The exponential grows so fast that a score of 8 vs 32 is not "4x smaller" - it is $e^{-24}$ times smaller, which is essentially zero. So the lowest score does not get "slightly less" attention - it gets attention that rounds to zero to many decimal places. This is why scaling matters: it keeps all scores close enough together that the exponentials stay in a comparable range.
 
-```mermaid
+> [!NOTE]
+> **How to recognize large dot products and verify scaling is working - a QA checklist.**
+>
+> You cannot see the raw dot product scores during normal training, but you can detect the symptoms and verify the fix is in place. Here are the concrete signals to check and how to check them:
+>
+> **Signal 1 - attention maps look like a single bright spot per row.**
+> Run `python -m src.main visualize` and open `artifacts/attention_heatmap_layer1.png`. If every row of every head's heatmap has one cell that is nearly white (value close to 1.0) and everything else is nearly black (value close to 0.0), that is softmax saturation. A healthy map has visible gradient across multiple cells in each row - some cells brighter, some dimmer, but rarely is any single cell overwhelmingly dominant in every row.
+>
+> **Three distinct patterns you will see, and what to do about each one:**
+>
+> **Pattern A - one bright dot per row, everything else black (saturation).**
+> The scores going into softmax are too large. The softmax collapses to a near-one-hot spike and most attention weights become zero. Fix: verify the `/ math.sqrt(head_dim)` scaling is in place. Increase dropout slightly (`--dropout 0.2`). Lower the learning rate so early training steps do not drive weights to extreme values before the model has had time to spread attention.
+>
+> **Pattern B - completely flat, uniform gray across every cell (the "flat line").**
+> Every position attends to every other position with roughly equal weight (about 1/16 = 0.0625 each for seq_len=16). This means the head has not learned to prefer any specific positions - it is basically computing a plain average with no discrimination. The head is contributing almost nothing useful. There are two causes and two different fixes:
+> - *Cause 1 - learning rate too low or training stopped too early.* The head never had enough gradient signal to move away from its random initialization, which tends to produce roughly uniform scores. Fix: increase `--lr` (try `3e-3`) or train for more epochs.
+> - *Cause 2 - dropout too high.* If dropout is randomly zeroing out large fractions of the attention weights during training, the model learns to keep all weights small and equal to avoid any single weight being relied on. Fix: lower `--dropout` to `0.05` or `0.1`.
+>
+> **Pattern C - bright band along the main diagonal, dimmer elsewhere (local context).**
+> Each position attends mostly to itself and its immediate neighbors. This is a common, healthy intermediate pattern - the head has learned positional proximity. It is not saturation (multiple cells are lit per row) and not flat (the diagonal is clearly brighter). For this project's task (endpoint equality), a diagonal head is not the most useful head - you want at least one head with bright off-diagonal spots at positions (0, 15) and (15, 0). If all four heads are diagonal, the model is solving the task through positional proximity only and may plateau below peak accuracy.
+>
+> **How to push a flat or diagonal map toward the target (0,15) pattern:**
+> 1. Increase `--embed-dim` - more dimensions give each head more capacity to encode token identity separately from position, making it easier to learn value-matching.
+> 2. Increase `--epochs` - the endpoint equality signal is subtle; early training tends to produce proximity patterns first. More epochs allow the optimizer to refine toward the exact-match pattern.
+> 3. Lower `--lr` slightly if maps are chaotic/noisy; raise it if maps are stuck flat after many epochs.
+> 4. The positional embedding already encodes slot identity, so the model has all the information it needs - it is purely a matter of whether training has had enough iterations to discover the (0,15) connection.
+>
+> **Signal 2 - training loss drops fast then completely stalls.**
+> If the loss curve drops sharply in epoch 1 then goes flat for all remaining epochs, the model may have saturated its attention weights early and lost the ability to refine them. Healthy training shows a gradual, continuing decrease across many epochs.
+>
+> **Signal 3 - add a temporary score magnitude check to the attention code.**
+> In `src/model/attention.py`, the raw scores are computed before the scaling divide. You can add one line to print the standard deviation of scores during the first forward pass:
+> ```python
+> scores = torch.matmul(Q, K.transpose(-2, -1))
+> # QA check - remove after verification:
+> print(f"[QA] pre-scale score std: {scores.std().item():.3f}  (should be near sqrt(head_dim) = {head_dim**0.5:.1f})")
+> scores = scores / math.sqrt(self.head_dim)
+> # QA check - remove after verification:
+> print(f"[QA] post-scale score std: {scores.std().item():.3f}  (should be near 1.0)")
+> ```
+> If the post-scale std is much larger than 1.0, your scaling is not working correctly. If it is near 1.0, the scores are in the safe range and softmax will stay spread-out.
+>
+> **Signal 4 - check that the code always divides by `sqrt(head_dim)`, not `sqrt(embed_dim)`.**
+> This is a common mistake. Each head operates in a `head_dim`-dimensional subspace (16 in this project, not 64). The correct divisor is `sqrt(head_dim)` because that is the dimension of the space where Q and K live. Dividing by `sqrt(embed_dim)` over-scales and makes scores too small, suppressing attention; skipping the divide entirely under-scales and causes saturation.
+>
+> **Signal 5 - verify the standard deviation of your Q and K weight initializations.**
+> PyTorch's `nn.Linear` initializes weights with **Kaiming uniform** by default, which keeps activations in a reasonable range. If you ever replace the attention projection layers with custom initialization, make sure Q and K weights have standard deviation near `1 / sqrt(head_dim)`. You can check: `print(model.encoder_blocks[0].attention.W_q.weight.std())` - it should be a small number (around 0.06 to 0.12 for `head_dim=16`), not a large one.
+>
+> **What is Kaiming uniform and what is Xavier uniform - and what is the difference?**
+>
+> Both are answers to the same question: *what values should the weight matrix start at before training begins?* If weights start too large, activations explode through the layers - each layer multiplies its input by the weight matrix, and if those values are big, the signal grows exponentially with depth. If weights start too small, activations shrink to zero through the layers, gradients vanish, and nothing learns. Both methods set the initial weight scale to keep the variance of activations roughly constant from layer to layer.
+>
+> **Xavier uniform** (also called Glorot uniform) was designed for layers followed by sigmoid or tanh activations. It sets the weight range based on the number of inputs to and outputs from a layer: weights are drawn uniformly from $[-\sqrt{6 / (\text{fan\_in} + \text{fan\_out})},\ +\sqrt{6 / (\text{fan\_in} + \text{fan\_out})}]$. The logic is: with sigmoid/tanh, you want the signal to neither grow nor shrink on average, and that formula achieves it when the activation function is roughly linear near zero.
+>
+> **Kaiming uniform** (also called He uniform) was designed for layers followed by ReLU activations. ReLU kills all negative values (outputs exactly 0 for any negative input), which means roughly half of all activations are dead after each layer. That halves the effective signal. Kaiming compensates by using a wider initial range: weights are drawn from $[-\sqrt{6 / \text{fan\_in}},\ +\sqrt{6 / \text{fan\_in}}]$, using only `fan_in` in the denominator (not the average of fan_in and fan_out). The wider spread counteracts the signal loss from the dead half of ReLU.
+>
+> | # | <sub>Property</sub> | <sub>Xavier uniform</sub> | <sub>Kaiming uniform</sub> |
+> |---|---|---|---|
+> | 1 | <sub>Designed for activation</sub> | <sub>Sigmoid, tanh - smooth curves near zero</sub> | <sub>ReLU and variants - hard zero cutoff for negatives</sub> |
+> | 2 | <sub>Scale formula</sub> | <sub>sqrt(6 / (fan_in + fan_out))</sub> | <sub>sqrt(6 / fan_in) - wider because ReLU kills half the signal</sub> |
+> | 3 | <sub>Why the difference</sub> | <sub>Sigmoid/tanh preserve sign - no signal is killed</sub> | <sub>ReLU zeros out all negatives - initial weights must be wider to compensate</sub> |
+> | 4 | <sub>What fan_in means</sub> | <sub>Number of inputs to this layer (e.g. 64 for a Linear(64, 128))</sub> | <sub>Same - number of inputs feeding into each output neuron</sub> |
+> | 5 | <sub>What fan_out means</sub> | <sub>Number of outputs from this layer (e.g. 128 for a Linear(64, 128))</sub> | <sub>Not used in the Kaiming formula</sub> |
+> | 6 | <sub>Used in this project</sub> | <sub>Not used directly - but embedding layers use a similar idea</sub> | <sub>Yes - PyTorch applies it automatically to all nn.Linear layers</sub> |
+> | 7 | <sub>What goes wrong if you use Xavier with ReLU</sub> | <sub>Activations shrink layer by layer - gradients vanish in deep networks</sub> | <sub>N/A</sub> |
+> | 8 | <sub>What goes wrong if you use Kaiming with sigmoid</sub> | <sub>Activations may be slightly larger than needed but usually still works</sub> | <sub>N/A</sub> |
+>
+> **For attention layers specifically**, neither is a perfect fit because Q and K projections are not followed by ReLU or sigmoid - they feed into a dot product and softmax. PyTorch still applies Kaiming uniform to `nn.Linear` by default, and it works well enough in practice. The more important constraint for attention is the post-scale dot product standard deviation (Signal 3 above) rather than the initialization scheme itself.
+>
+> **The one rule that prevents all of this:** always divide by `sqrt(head_dim)` immediately after computing `Q @ K.T`, before any softmax. That one line is the entire fix. It is already in `src/model/attention.py` in this project - the checklist above is for when you build a new attention implementation from scratch or modify the existing one.
+
+
 flowchart TD
     US1["WITHOUT scaling  dk 64  Raw scores: 32, 16, 8"]
     US2["softmax output  0.9999, 0.0001, near 0"]
