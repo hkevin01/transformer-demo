@@ -19,7 +19,9 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--embed-dim", type=int, default=64)
     train_parser.add_argument("--num-heads", type=int, default=4)
     train_parser.add_argument("--ff-hidden-dim", type=int, default=128)
-    train_parser.add_argument("--num-layers", type=int, default=2)
+    train_parser.add_argument("--num-layers", type=int, default=2,
+                               choices=range(1, 25),
+                               metavar="NUM_LAYERS (1-24)")
     train_parser.add_argument("--dropout", type=float, default=0.1)
     train_parser.add_argument("--lr", type=float, default=1e-3)
     train_parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -36,7 +38,9 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--embed-dim", type=int, default=64)
     eval_parser.add_argument("--num-heads", type=int, default=4)
     eval_parser.add_argument("--ff-hidden-dim", type=int, default=128)
-    eval_parser.add_argument("--num-layers", type=int, default=2)
+    eval_parser.add_argument("--num-layers", type=int, default=2,
+                              choices=range(1, 25),
+                              metavar="NUM_LAYERS (1-24)")
     eval_parser.add_argument("--dropout", type=float, default=0.1)
     eval_parser.add_argument("--test-size", type=int, default=800)
     eval_parser.add_argument("--seed", type=int, default=42)
@@ -49,7 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     viz_parser.add_argument("--embed-dim", type=int, default=64)
     viz_parser.add_argument("--num-heads", type=int, default=4)
     viz_parser.add_argument("--ff-hidden-dim", type=int, default=128)
-    viz_parser.add_argument("--num-layers", type=int, default=2)
+    viz_parser.add_argument("--num-layers", type=int, default=2,
+                             choices=range(1, 25),
+                             metavar="NUM_LAYERS (1-24)")
     viz_parser.add_argument("--dropout", type=float, default=0.1)
     viz_parser.add_argument("--seed", type=int, default=42)
     viz_parser.add_argument("--artifacts-dir", type=str, default="artifacts")

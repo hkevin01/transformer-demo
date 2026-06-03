@@ -146,23 +146,21 @@ The scaling factor $\frac{1}{\sqrt{d_k}}$ in the attention formula is one of the
 > **Problem 3 - why low scores disappear fastest under softmax saturation.** The softmax function is $e^{x_i} / \sum_j e^{x_j}$. When one score is much larger than the others, its exponential dominates the denominator. The exponential grows so fast that a score of 8 vs 32 is not "4x smaller" - it is $e^{-24}$ times smaller, which is essentially zero. So the lowest score does not get "slightly less" attention - it gets attention that rounds to zero to many decimal places. This is why scaling matters: it keeps all scores close enough together that the exponentials stay in a comparable range.
 
 ```mermaid
-flowchart LR
-    subgraph UNSCALED["Without Scaling  d_k=64"]
-        US1["Raw scores: 32, 16, 8"]
-        US2["softmax: 0.9999, 0.0001, 0.0"]
-        US3["Near one-hot spike"]
-        US4["Gradient ~0 for positions 1 and 2"]
-        US5["Training signal LOST"]
-        US1 --> US2 --> US3 --> US4 --> US5
-    end
-    subgraph SCALED["With Scaling  divide by sqrt 64 = 8"]
-        SS1["Scaled scores: 4.0, 2.0, 1.0"]
-        SS2["softmax: 0.84, 0.11, 0.04"]
-        SS3["Spread-out distribution"]
-        SS4["Gradient flows to ALL positions"]
-        SS5["Training signal PRESERVED"]
-        SS1 --> SS2 --> SS3 --> SS4 --> SS5
-    end
+flowchart TD
+    US1["WITHOUT scaling  d_k=64\nRaw scores: 32, 16, 8"]
+    US2["softmax output\n0.9999, 0.0001, ~0.0"]
+    US3["Near one-hot spike\nall weight on position 0"]
+    US4["Gradient ~0 for positions 1 and 2"]
+    US5["Training signal LOST"]
+
+    SS1["WITH scaling  divide by sqrt 64 equals 8\nScaled scores: 4.0, 2.0, 1.0"]
+    SS2["softmax output\n0.84, 0.11, 0.04"]
+    SS3["Spread-out distribution\nall positions contribute"]
+    SS4["Gradient flows to ALL positions"]
+    SS5["Training signal PRESERVED"]
+
+    US1 --> US2 --> US3 --> US4 --> US5
+    SS1 --> SS2 --> SS3 --> SS4 --> SS5
 
     style US1 fill:#fde68a,stroke:#d97706,color:#000
     style US2 fill:#fca5a5,stroke:#dc2626,color:#000
@@ -217,32 +215,32 @@ The atomic unit of the Transformer is scaled dot-product attention. The query ma
 
 ```mermaid
 flowchart TD
-    X["Input X\nbatch x seq x embed_dim"]
-    Q["Q = X times W_Q\nbatch x heads x seq x head_dim"]
-    K["K = X times W_K\nbatch x heads x seq x head_dim"]
-    V["V = X times W_V\nbatch x heads x seq x head_dim"]
-    SCORES["Scores = QK-transpose divided by sqrt d_k\nbatch x heads x seq x seq"]
+    INP["Input X  shape: batch, seq, embed_dim"]
+    WQ["W_Q projection\nbatch, heads, seq, head_dim"]
+    WK["W_K projection\nbatch, heads, seq, head_dim"]
+    WV["W_V projection\nbatch, heads, seq, head_dim"]
+    SCORES["Q dot K-T divided by sqrt d_k\nbatch, heads, seq, seq"]
     MASK["Optional Mask\nadditive or boolean"]
-    SOFTMAX["Softmax -- Attention Weights\nbatch x heads x seq x seq"]
-    ATTENDED["Attended = Weights times V\nbatch x heads x seq x head_dim"]
-    MERGE["Merge Heads -- Concat\nbatch x seq x embed_dim"]
-    OUT["Output Projection times W_O\nbatch x seq x embed_dim"]
+    SOFTMAX["Softmax\nAttention Weights\nbatch, heads, seq, seq"]
+    ATTENDED["Weights dot V\nbatch, heads, seq, head_dim"]
+    MERGE["Concat Heads\nbatch, seq, embed_dim"]
+    OUT["Output Projection W_O\nbatch, seq, embed_dim"]
 
-    X --> Q
-    X --> K
-    X --> V
-    Q --> SCORES
-    K --> SCORES
+    INP --> WQ
+    INP --> WK
+    INP --> WV
+    WQ --> SCORES
+    WK --> SCORES
     MASK --> SCORES
     SCORES --> SOFTMAX
     SOFTMAX --> ATTENDED
-    V --> ATTENDED
+    WV --> ATTENDED
     ATTENDED --> MERGE --> OUT
 
-    style X fill:#3b82f6,stroke:#1d4ed8,color:#fff
-    style Q fill:#8b5cf6,stroke:#6d28d9,color:#fff
-    style K fill:#8b5cf6,stroke:#6d28d9,color:#fff
-    style V fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style INP fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style WQ fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style WK fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style WV fill:#8b5cf6,stroke:#6d28d9,color:#fff
     style SCORES fill:#f97316,stroke:#c2410c,color:#fff
     style MASK fill:#6b7280,stroke:#374151,color:#fff
     style SOFTMAX fill:#f97316,stroke:#c2410c,color:#fff
@@ -328,23 +326,31 @@ Each encoder block applies self-attention followed by a position-wise feed-forwa
 
 ```mermaid
 flowchart LR
-    IN["Input x\nbatch x seq x D"]
-    ATTN["Multi-Head\nSelf-Attention"]
+    IN["Input\nbatch, seq, D"]
+    SKIP1["skip copy 1"]
+    ATTN["Multi-Head Self-Attention"]
     DROP1["Dropout"]
-    ADD1["Add + LayerNorm"]
-    FFN["Position-wise FFN\nLinear - ReLU - Dropout - Linear"]
+    ADD1["Add and LayerNorm\nresidual 1"]
+    SKIP2["skip copy 2"]
+    FFN["Position-wise FFN\nLinear ReLU Dropout Linear"]
     DROP2["Dropout"]
-    ADD2["Add + LayerNorm"]
-    OUT["Output\nbatch x seq x D"]
+    ADD2["Add and LayerNorm\nresidual 2"]
+    OUT["Output\nbatch, seq, D"]
 
-    IN --> ATTN --> DROP1 --> ADD1 --> FFN --> DROP2 --> ADD2 --> OUT
-    IN -->|"residual"| ADD1
-    ADD1 -->|"residual"| ADD2
+    IN --> SKIP1
+    IN --> ATTN --> DROP1 --> ADD1
+    SKIP1 --> ADD1
+    ADD1 --> SKIP2
+    ADD1 --> FFN --> DROP2 --> ADD2
+    SKIP2 --> ADD2
+    ADD2 --> OUT
 
     style IN fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style SKIP1 fill:#d1d5db,stroke:#6b7280,color:#000
     style ATTN fill:#8b5cf6,stroke:#6d28d9,color:#fff
     style DROP1 fill:#6b7280,stroke:#374151,color:#fff
     style ADD1 fill:#f97316,stroke:#c2410c,color:#fff
+    style SKIP2 fill:#d1d5db,stroke:#6b7280,color:#000
     style FFN fill:#8b5cf6,stroke:#6d28d9,color:#fff
     style DROP2 fill:#6b7280,stroke:#374151,color:#fff
     style ADD2 fill:#f97316,stroke:#c2410c,color:#fff
@@ -381,9 +387,10 @@ flowchart TD
     TOKENS --> POS_EMB
     TOK_EMB --> SUM
     POS_EMB --> SUM
-    SUM --> B1 --> B2
-    B1 -->|"attn_weights layer 1"| MAPS
-    B2 -->|"attn_weights layer 2"| MAPS
+    SUM --> B1
+    B1 --> B2
+    B1 --> MAPS
+    B2 --> MAPS
     B2 --> POOL --> HEAD --> LOGITS
 
     style TOKENS fill:#3b82f6,stroke:#1d4ed8,color:#fff
