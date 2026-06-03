@@ -46,6 +46,23 @@ The task chosen to demonstrate the model is **toy sequence classification**: giv
 
 Traditional sequence models like RNNs and CNNs process tokens either one at a time or within a fixed local window. This makes it structurally difficult for them to relate tokens that are far apart in a sequence. Self-attention solves this by computing a **direct pairwise relationship score between every token and every other token** in the sequence simultaneously. The result is a weighted mixture of all token representations, where the weights reflect how relevant each other position is when computing the representation for the current position.
 
+> [!NOTE]
+> **What does "pairwise score between every token and every other token" mean?**
+>
+> Take a 5-token sentence: `["The", "cat", "sat", "on", "mat"]`. A *pairwise* score means we compute one score for every possible ordered pair of positions - that is 5 x 5 = 25 scores total. Each score answers one specific question: *"when building token i's new representation, how much should it draw from token j?"*
+>
+> After softmax, those scores become attention weights (each row sums to 1.0). Here is what a well-trained head might produce on this sentence:
+>
+> |  | The | cat | sat | on | mat |
+> |---|---|---|---|---|---|
+> | **The** | 0.05 | **0.60** | 0.10 | 0.05 | 0.20 |
+> | **cat** | 0.10 | 0.05 | **0.55** | 0.10 | 0.20 |
+> | **sat** | 0.05 | **0.50** | 0.05 | 0.15 | 0.25 |
+> | **on** | 0.10 | 0.10 | 0.20 | 0.05 | **0.55** |
+> | **mat** | 0.15 | 0.20 | 0.25 | **0.40** | 0.00 |
+>
+> Reading row by row: "The" attends most to "cat" (its noun), "cat" attends most to "sat" (its verb), "sat" attends most to "cat" (its subject), and "on" attends most to "mat" (its prepositional object). No RNN loop is needed - every token directly reaches every other token in one matrix multiplication. The distances between positions ("The" is 3 positions from "on") are irrelevant; the attention weight is learned from content alone, which is exactly why attention handles long-range dependencies so naturally.
+
 The scaling factor $\frac{1}{\sqrt{d_k}}$ in the attention formula is one of the most important details in the original paper and is easy to overlook. Without it, the dot products between queries and keys grow proportionally to the embedding dimension, and that causes a serious problem during training.
 
 > [!WARNING]
@@ -62,31 +79,67 @@ The scaling factor $\frac{1}{\sqrt{d_k}}$ in the attention formula is one of the
 >
 > When softmax produces a near-one-hot spike, the gradient of the loss with respect to the attention score inputs is almost exactly zero for all non-maximum positions. This is called **softmax saturation** - the model effectively stops learning from most of the attention weights. Dividing by $\sqrt{d_k}$ keeps scores in a range where softmax stays spread-out and gradients remain non-zero.
 
+> [!NOTE]
+> **Why is "only position 0 matters" so harmful, and what happens if you skip softmax entirely?**
+>
+> **Problem 1 - softmax saturation makes most weights unlearnable.** When unscaled scores produce `softmax([32, 16, 8]) = [0.9999, 0.0001, ~0.0]`, the weights for positions 1 and 2 are frozen near zero. The model cannot learn to pay attention to them even when they contain the correct answer, because the gradient signal that would adjust those weights has vanished. The model is stuck - it has "decided" that position 0 always matters most, and it can barely escape that local minimum.
+>
+> **Problem 2 - without softmax at all, the weights would be raw unbounded numbers.** Softmax serves two purposes: (1) it normalizes scores into a valid probability distribution that sums to 1.0, and (2) it amplifies the differences between scores in a controlled way. Without softmax, the attention output would just be `scores · V` where scores could be any large positive or negative number. There is no guarantee the output stays in a bounded range, training becomes numerically unstable, and the output cannot be interpreted as a weighted mixture - you lose the elegant "how much do I draw from each token" semantics entirely.
+>
+> **Problem 3 - why low scores disappear fastest under softmax saturation.** The softmax function is $e^{x_i} / \sum_j e^{x_j}$. When one score is much larger than the others, its exponential dominates the denominator. The exponential grows so fast that a score of 8 vs 32 is not "4x smaller" - it is $e^{-24}$ times smaller, which is essentially zero. So the lowest score does not get "slightly less" attention - it gets attention that rounds to zero to many decimal places. This is why scaling matters: it keeps all scores close enough together that the exponentials stay in a comparable range.
+
 ```mermaid
-graph LR
-    subgraph UNSCALED["Without Scaling  (d_k=64, scores grow to ~32)"]
-        direction TB
+flowchart LR
+    subgraph UNSCALED["Without Scaling  d_k=64"]
         US1["Raw scores: 32, 16, 8"]
-        US2["softmax → 0.9999, 0.0001, ~0"]
+        US2["softmax: 0.9999, 0.0001, 0.0"]
         US3["Near one-hot spike"]
-        US4["Gradient ≈ 0 for positions 1 and 2"]
-        US5["Training signal lost"]
+        US4["Gradient ~0 for positions 1 and 2"]
+        US5["Training signal LOST"]
         US1 --> US2 --> US3 --> US4 --> US5
     end
-    subgraph SCALED["With Scaling  (divide by sqrt(64)=8)"]
-        direction TB
+    subgraph SCALED["With Scaling  divide by sqrt 64 = 8"]
         SS1["Scaled scores: 4.0, 2.0, 1.0"]
-        SS2["softmax → 0.84, 0.11, 0.04"]
+        SS2["softmax: 0.84, 0.11, 0.04"]
         SS3["Spread-out distribution"]
-        SS4["Gradient flows to all positions"]
-        SS5["Training signal preserved"]
+        SS4["Gradient flows to ALL positions"]
+        SS5["Training signal PRESERVED"]
         SS1 --> SS2 --> SS3 --> SS4 --> SS5
     end
+
+    style US1 fill:#fde68a,stroke:#d97706,color:#000
+    style US2 fill:#fca5a5,stroke:#dc2626,color:#000
+    style US3 fill:#fca5a5,stroke:#dc2626,color:#000
+    style US4 fill:#f87171,stroke:#dc2626,color:#fff
+    style US5 fill:#dc2626,stroke:#991b1b,color:#fff
+    style SS1 fill:#d1fae5,stroke:#059669,color:#000
+    style SS2 fill:#6ee7b7,stroke:#059669,color:#000
+    style SS3 fill:#6ee7b7,stroke:#059669,color:#000
+    style SS4 fill:#34d399,stroke:#059669,color:#000
+    style SS5 fill:#059669,stroke:#065f46,color:#fff
 ```
 
 $$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$
 
-Multi-head attention repeats this process in parallel across several learned subspaces, allowing the model to jointly attend to information from different representational perspectives at different positions. Think of it as several specialists each reading the same sequence but looking for different kinds of relationships - one head might learn to match token identities (directly useful for this task), another might track positional distance, and a third might detect co-occurrence patterns.
+Multi-head attention repeats this process in parallel across several learned subspaces, allowing the model to jointly attend to information from different representational perspectives at different positions. "Different representational perspectives" means each head gets its own learned Q, K, V projection matrices - so each one learns to look for a fundamentally different type of relationship in the data.
+
+> [!NOTE]
+> **What does "different representational perspectives" actually look like? Real examples.**
+>
+> In large language models trained on real text, researchers have found that individual attention heads specialize in surprisingly concrete tasks. Here are examples of the kinds of roles heads can learn:
+>
+> | Head role | What it detects | Example |
+> |---|---|---|
+> | **Syntactic subject-verb** | Which noun is the subject of which verb | "The cat sat" - "cat" and "sat" get high mutual attention |
+> | **Coreference** | Which pronoun refers to which noun | "Alice said she..." - "she" attends to "Alice" |
+> | **Positional proximity** | Tokens near each other in the sequence | Bigram-style local relationships |
+> | **Delimiter tracking** | Commas, periods, brackets | A comma head attends from the clause before to the clause after |
+> | **Semantic similarity** | Tokens with similar meaning | Synonyms or related words attend to each other |
+> | **Copy/match** | Identical or repeated tokens | A head that fires when two positions hold the same token value |
+>
+> In **this project specifically**, the model needs to solve "does position 0 equal position 15?" One head will likely specialize in the **copy/match** role - it learns Q and K projections where the same token ID produces a high dot product with itself across any distance. Another head might specialize in positional anchoring ("am I near the start or end of the sequence?"). The other two heads can learn complementary or backup patterns.
+>
+> This specialization is why removing multi-head and using a single head would hurt performance: a single head's Q and K projections have to simultaneously solve all of these problems, which is a much harder optimization target.
 
 > [!IMPORTANT]
 > The task (first token equals last token) is designed so that a model **without** attention cannot reliably solve it after mean-pooling, because averaging destroys positional information. The Transformer can solve it precisely because attention can learn to directly compare position 0 and position $L-1$.
@@ -107,23 +160,38 @@ The atomic unit of the Transformer is scaled dot-product attention. The query ma
 
 ```mermaid
 flowchart TD
-    X["Input X\n(batch, seq, embed_dim)"]
-    Q["Q = X · W_Q\n(batch, heads, seq, head_dim)"]
-    K["K = X · W_K\n(batch, heads, seq, head_dim)"]
-    V["V = X · W_V\n(batch, heads, seq, head_dim)"]
-    SCORES["Scores = QKᵀ / √d_k\n(batch, heads, seq, seq)"]
-    MASK["Optional Mask\n(additive or boolean)"]
-    SOFTMAX["Softmax → Attention Weights\n(batch, heads, seq, seq)"]
-    ATTENDED["Attended = Weights · V\n(batch, heads, seq, head_dim)"]
-    MERGE["Merge Heads → Concat\n(batch, seq, embed_dim)"]
-    OUT["Output Projection · W_O\n(batch, seq, embed_dim)"]
+    X["Input X\nbatch x seq x embed_dim"]
+    Q["Q = X times W_Q\nbatch x heads x seq x head_dim"]
+    K["K = X times W_K\nbatch x heads x seq x head_dim"]
+    V["V = X times W_V\nbatch x heads x seq x head_dim"]
+    SCORES["Scores = QK-transpose divided by sqrt d_k\nbatch x heads x seq x seq"]
+    MASK["Optional Mask\nadditive or boolean"]
+    SOFTMAX["Softmax -- Attention Weights\nbatch x heads x seq x seq"]
+    ATTENDED["Attended = Weights times V\nbatch x heads x seq x head_dim"]
+    MERGE["Merge Heads -- Concat\nbatch x seq x embed_dim"]
+    OUT["Output Projection times W_O\nbatch x seq x embed_dim"]
 
-    X --> Q & K & V
-    Q & K --> SCORES
+    X --> Q
+    X --> K
+    X --> V
+    Q --> SCORES
+    K --> SCORES
     MASK --> SCORES
     SCORES --> SOFTMAX
-    SOFTMAX & V --> ATTENDED
+    SOFTMAX --> ATTENDED
+    V --> ATTENDED
     ATTENDED --> MERGE --> OUT
+
+    style X fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style Q fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style K fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style V fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style SCORES fill:#f97316,stroke:#c2410c,color:#fff
+    style MASK fill:#6b7280,stroke:#374151,color:#fff
+    style SOFTMAX fill:#f97316,stroke:#c2410c,color:#fff
+    style ATTENDED fill:#14b8a6,stroke:#0f766e,color:#fff
+    style MERGE fill:#14b8a6,stroke:#0f766e,color:#fff
+    style OUT fill:#22c55e,stroke:#15803d,color:#fff
 ```
 
 ### Transformer Encoder Block
@@ -131,31 +199,99 @@ flowchart TD
 Each encoder block applies self-attention followed by a position-wise feed-forward network (FFN). Both sub-layers use **Pre-LN style** residual connections - a residual skip connection wraps each sub-layer, and layer normalization is applied after the addition. Dropout is applied to the output of each sub-layer before the residual addition, acting as a regularizer.
 
 > [!NOTE]
-> **What is an Encoder Block?** An encoder block is a self-contained, reusable processing unit. It takes a sequence of vectors as input and returns an equal-length sequence of vectors as output - it never changes the shape. Inside, it does exactly two things in order: (1) multi-head self-attention to let every token gather context from every other token, and (2) a feed-forward network applied position-by-position. The word *encoder* means the block reads and enriches an existing representation, as opposed to a *decoder* which generates new tokens by additionally attending to an encoder output. The word *block* is just one complete layer. The *encoder stack* (also called the encoder tower) is the sequence of `num_layers=2` blocks chained end-to-end, where the output of block 1 is the input to block 2.
+> **What is an Encoder Block?** An encoder block is a self-contained, reusable processing unit. It takes a sequence of vectors as input and returns an equal-length sequence of vectors as output - the shape never changes. Inside, it does exactly two things in order: (1) multi-head self-attention so every token gathers context from every other token, and (2) a feed-forward network applied independently to each position.
+>
+> **Concrete walkthrough - one block processing the sentence `["cat", "sat", "mat"]`:**
+>
+> ```
+> Input to Block 1  (3 tokens x 64 dims each):
+>   "cat"  → [0.21, -0.55, 1.03, ...]   (64 numbers encoding "cat")
+>   "sat"  → [0.88,  0.12, -0.73, ...]  (64 numbers encoding "sat")
+>   "mat"  → [-0.44, 0.67,  0.31, ...]  (64 numbers encoding "mat")
+>
+> After Self-Attention inside Block 1:
+>   "cat"  → [0.45, -0.31, 0.91, ...]   (now knows about "sat" and "mat")
+>   "sat"  → [0.72,  0.38, -0.50, ...]  (now knows about "cat" and "mat")
+>   "mat"  → [-0.20, 0.81,  0.55, ...]  (now knows about "cat" and "sat")
+>
+> After FFN inside Block 1  (same shape, nonlinearly transformed):
+>   "cat"  → [0.61, -0.12, 1.15, ...]   (further enriched)
+>   "sat"  → [0.90,  0.55, -0.31, ...]  (further enriched)
+>   "mat"  → [-0.10, 0.92,  0.71, ...]  (further enriched)
+>
+> Output feeds directly into Block 2 as its input.
+> ```
+>
+> The word *encoder* means the block reads and enriches an existing representation - it never generates or predicts new tokens (that is what a *decoder* does). The word *block* is just one complete layer. The *encoder stack* is `num_layers=2` blocks chained end-to-end.
 
 > [!NOTE]
 > **What is a Feed-Forward Network (FFN)?** The FFN in this project is a small two-layer MLP: `Linear(64→128) → ReLU → Dropout → Linear(128→64)`. It is applied identically and independently to each token position - the same weight matrix is reused for every position, which is why it is called *position-wise*. Its purpose is to add nonlinear transformation capacity after the attention step. Attention is fundamentally a weighted average (a linear operation), so without the FFN, stacking more blocks would collapse into a single linear transform. The FFN is where the model learns to transform and store token-specific features.
 
 > [!NOTE]
-> **What is ReLU?** ReLU stands for Rectified Linear Unit. It is the activation function `f(x) = max(0, x)` - positive values pass through unchanged, negative values become zero. It is placed between the two linear layers of the FFN to introduce nonlinearity. Without it, two linear layers collapse into one linear layer, and the entire network could only learn linear functions. ReLU is computationally cheap, works well in deep networks, and avoids the vanishing gradient problem that affected older activations like sigmoid and tanh, which saturate at both ends of their output range.
+> **What is ReLU?** ReLU stands for Rectified Linear Unit. It is the activation function `f(x) = max(0, x)` - positive values pass through unchanged, negative values become zero. It is placed between the two linear layers of the FFN to introduce nonlinearity. Without it, two linear layers collapse into one linear layer and the network could only learn linear transformations.
+>
+> **Concrete numerical example:**
+>
+> ```
+> Input to FFN for one token:  [-1.2,  3.4,  0.0, -0.5,  2.1]
+>
+> After Linear(64→128):
+>   hidden = [-2.1,  1.8, -0.3,  4.2, -1.5, ...]
+>
+> After ReLU  max(0, x):
+>   hidden = [ 0.0,  1.8,  0.0,  4.2,  0.0, ...]
+>   (all negative values become 0 - the neuron "did not fire")
+>
+> After Linear(128→64):
+>   output = [new enriched 64-dim representation]
+> ```
+>
+> The neurons that output zero are said to be "dead" for that input - they contribute nothing. This is intentional: the network learns which features to activate for which inputs. Neurons that are dead for irrelevant features simply pass no signal, creating a sparse, efficient representation. ReLU avoids the vanishing gradient problem that affected sigmoid/tanh, which saturate near 0 or 1 and produce gradients close to zero even for inputs far from their operating range.
 
 > [!NOTE]
-> **What is Dropout?** Dropout is a regularization technique invented to prevent overfitting. During training, it randomly sets a fraction of activations to zero - in this project `--dropout 0.1` means 10% of outputs are zeroed at random each forward pass. This forces the network not to rely on any single activation or attention weight, because that path might be disabled on the next batch. The result is a more robust, generalized model. During evaluation (`model.eval()`), dropout is disabled and all activations are live. Think of it like training with random crew absences - the team learns to cover for each other, making the whole system more fault-tolerant.
+> **What is Dropout?** Dropout is a regularization technique that prevents overfitting by randomly zeroing out activations during training. With `--dropout 0.1`, exactly 10% of outputs are zeroed at random on every forward pass. Each batch sees a different random mask, so the network cannot memorize any single path through the weights.
+>
+> **Concrete example - before and after dropout (p=0.1, training mode):**
+>
+> ```
+> Attention output for one token (16 values shown):
+>   Before: [0.82, -0.31, 1.20,  0.05, -0.77, 0.44, 1.03, -0.12,
+>             0.66,  0.38, -0.90, 0.71,  0.23, -0.55, 0.88,  0.14]
+>
+>   Dropout mask (1=keep, 0=zero, ~10% zeroed):
+>            [  1,    1,    1,    1,    0,    1,    1,    1,
+>               1,    0,    1,    1,    1,    1,    1,    1  ]
+>
+>   After:  [0.82, -0.31, 1.20,  0.05,  0.00, 0.44, 1.03, -0.12,
+>             0.66,  0.00, -0.90, 0.71,  0.23, -0.55, 0.88,  0.14]
+>            (positions 4 and 9 zeroed this batch - different positions next batch)
+> ```
+>
+> Because the zeroed positions are random and change every batch, the network learns to distribute information redundantly rather than routing everything through a small number of high-weight paths. During evaluation, `model.eval()` disables dropout and all activations are live. The outputs are also rescaled by `1/(1-p)` during training so that the expected value of each activation remains the same at inference time.
 
 ```mermaid
 flowchart LR
-    IN["Input x\n(batch, seq, D)"]
+    IN["Input x\nbatch x seq x D"]
     ATTN["Multi-Head\nSelf-Attention"]
     DROP1["Dropout"]
     ADD1["Add + LayerNorm"]
-    FFN["Position-wise FFN\nLinear → ReLU → Dropout → Linear"]
+    FFN["Position-wise FFN\nLinear - ReLU - Dropout - Linear"]
     DROP2["Dropout"]
     ADD2["Add + LayerNorm"]
-    OUT["Output\n(batch, seq, D)"]
+    OUT["Output\nbatch x seq x D"]
 
     IN --> ATTN --> DROP1 --> ADD1 --> FFN --> DROP2 --> ADD2 --> OUT
     IN -->|"residual"| ADD1
     ADD1 -->|"residual"| ADD2
+
+    style IN fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style ATTN fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style DROP1 fill:#6b7280,stroke:#374151,color:#fff
+    style ADD1 fill:#f97316,stroke:#c2410c,color:#fff
+    style FFN fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style DROP2 fill:#6b7280,stroke:#374151,color:#fff
+    style ADD2 fill:#f97316,stroke:#c2410c,color:#fff
+    style OUT fill:#22c55e,stroke:#15803d,color:#fff
 ```
 
 ### Full Model Forward Pass
@@ -173,22 +309,36 @@ The complete `TransformerSequenceClassifier` stacks two encoder blocks. Token ID
 
 ```mermaid
 flowchart TD
-    TOKENS["Input Tokens\n(batch, seq_len) - integer IDs"]
-    TOK_EMB["Token Embedding\n nn.Embedding(vocab_size, embed_dim)"]
-    POS_EMB["Positional Embedding\n nn.Embedding(max_seq_len, embed_dim)"]
-    SUM["Sum Embeddings\n(batch, seq_len, embed_dim)"]
+    TOKENS["Input Tokens\nbatch x seq_len -- integer IDs"]
+    TOK_EMB["Token Embedding\nnn.Embedding vocab_size x embed_dim"]
+    POS_EMB["Positional Embedding\nnn.Embedding max_seq_len x embed_dim"]
+    SUM["Sum Embeddings\nbatch x seq_len x embed_dim"]
     B1["Encoder Block 1\nSelf-Attn + FFN + ResNorm"]
     B2["Encoder Block 2\nSelf-Attn + FFN + ResNorm"]
-    POOL["Mean Pool over Sequence\n(batch, embed_dim)"]
-    HEAD["Classifier Head\nLinear → ReLU → Dropout → Linear"]
-    LOGITS["Logits\n(batch, num_classes=2)"]
+    POOL["Mean Pool over Sequence\nbatch x embed_dim"]
+    HEAD["Classifier Head\nLinear - ReLU - Dropout - Linear"]
+    LOGITS["Logits\nbatch x num_classes=2"]
     MAPS["Attention Maps\nReturned for visualization"]
 
-    TOKENS --> TOK_EMB & POS_EMB
-    TOK_EMB & POS_EMB --> SUM
+    TOKENS --> TOK_EMB
+    TOKENS --> POS_EMB
+    TOK_EMB --> SUM
+    POS_EMB --> SUM
     SUM --> B1 --> B2
-    B1 & B2 -->|"attn_weights"| MAPS
+    B1 -->|"attn_weights layer 1"| MAPS
+    B2 -->|"attn_weights layer 2"| MAPS
     B2 --> POOL --> HEAD --> LOGITS
+
+    style TOKENS fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style TOK_EMB fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style POS_EMB fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style SUM fill:#f97316,stroke:#c2410c,color:#fff
+    style B1 fill:#14b8a6,stroke:#0f766e,color:#fff
+    style B2 fill:#14b8a6,stroke:#0f766e,color:#fff
+    style POOL fill:#f97316,stroke:#c2410c,color:#fff
+    style HEAD fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style LOGITS fill:#22c55e,stroke:#15803d,color:#fff
+    style MAPS fill:#fbbf24,stroke:#d97706,color:#000
 ```
 
 ### Training Pipeline
@@ -223,14 +373,23 @@ The baseline model uses the same token and positional embedding as the Transform
 
 ```mermaid
 flowchart LR
-    subgraph TRANSFORMER["TransformerSequenceClassifier"]
-        direction TB
-        TE["Embed (tok + pos)"] --> TB1["Block 1"] --> TB2["Block 2"] --> TP["Mean Pool"] --> TH["MLP Head"] --> TL["Logits"]
+    subgraph TRANSFORMER["TransformerSequenceClassifier  ~97% accuracy"]
+        TE["Embed\ntok + pos"] --> TB1["Block 1\nAttn+FFN"] --> TB2["Block 2\nAttn+FFN"] --> TP["Mean Pool"] --> TH["MLP Head"] --> TL["Logits"]
     end
-    subgraph BASELINE["BaselineSequenceClassifier"]
-        direction TB
-        BE["Embed (tok + pos)"] --> BP["Mean Pool"] --> BH["MLP Head"] --> BL["Logits"]
+    subgraph BASELINE["BaselineSequenceClassifier  ~60% accuracy"]
+        BE["Embed\ntok + pos"] --> BP["Mean Pool"] --> BH["MLP Head"] --> BL["Logits"]
     end
+
+    style TE fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style TB1 fill:#14b8a6,stroke:#0f766e,color:#fff
+    style TB2 fill:#14b8a6,stroke:#0f766e,color:#fff
+    style TP fill:#f97316,stroke:#c2410c,color:#fff
+    style TH fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style TL fill:#22c55e,stroke:#15803d,color:#fff
+    style BE fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style BP fill:#f97316,stroke:#c2410c,color:#fff
+    style BH fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style BL fill:#ef4444,stroke:#dc2626,color:#fff
 ```
 
 > [!TIP]
@@ -244,24 +403,47 @@ Single-head attention runs the scaled dot-product attention once over the full `
 > **Single-head vs Multi-head - why does it matter?** A single attention head must simultaneously represent all types of relationships a token has with others using one shared set of projections. Multi-head attention gives each head its own independent projections, so Head 1 might learn to match token values (exactly what this task needs), Head 2 might track positional proximity, Head 3 might detect repetition, and Head 4 might learn a fallback catch-all pattern. The heads run in parallel and are cheap because each one works in a smaller `head_dim`-dimensional space rather than the full `embed_dim` space.
 
 ```mermaid
-graph TD
-    subgraph SINGLE["Single-Head  (one projection over full dim=64)"]
-        SX["Input X\n(batch, seq, 64)"] --> SQK["One set of Q, K, V projections"]
-        SQK --> SATTN["One attention computation\n(batch, seq, 64)"]
-        SATTN --> SOUT["Output  (batch, seq, 64)"]
+flowchart TD
+    subgraph SINGLE["Single-Head  one projection over full dim=64"]
+        SX["Input X\nbatch x seq x 64"]
+        SQK["One set of Q, K, V projections"]
+        SATTN["One attention computation\nbatch x seq x 64"]
+        SOUT["Output  batch x seq x 64"]
+        SX --> SQK --> SATTN --> SOUT
         SX -.->|"residual skip"| SOUT
     end
 
-    subgraph MULTI["Multi-Head  (4 heads, each dim=16, run in parallel)"]
-        MX["Input X\n(batch, seq, 64)"]
-        MX --> H1["Head 1\nQ,K,V in 16-dim space\nMay learn: token identity"]
-        MX --> H2["Head 2\nQ,K,V in 16-dim space\nMay learn: position distance"]
-        MX --> H3["Head 3\nQ,K,V in 16-dim space\nMay learn: co-occurrence"]
-        MX --> H4["Head 4\nQ,K,V in 16-dim space\nMay learn: other patterns"]
-        H1 & H2 & H3 & H4 --> CAT["Concatenate\n(batch, seq, 4x16=64)"]
-        CAT --> WO["Output projection W_O\n(batch, seq, 64)"]
+    subgraph MULTI["Multi-Head  4 heads each dim=16 run in parallel"]
+        MX["Input X\nbatch x seq x 64"]
+        H1["Head 1\n16-dim space\ntoken identity?"]
+        H2["Head 2\n16-dim space\nposition distance?"]
+        H3["Head 3\n16-dim space\nco-occurrence?"]
+        H4["Head 4\n16-dim space\nother patterns"]
+        CAT["Concat\nbatch x seq x 64"]
+        WO["Output projection W_O\nbatch x seq x 64"]
+        MX --> H1
+        MX --> H2
+        MX --> H3
+        MX --> H4
+        H1 --> CAT
+        H2 --> CAT
+        H3 --> CAT
+        H4 --> CAT
+        CAT --> WO
         MX -.->|"residual skip"| WO
     end
+
+    style SX fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style SQK fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style SATTN fill:#f97316,stroke:#c2410c,color:#fff
+    style SOUT fill:#22c55e,stroke:#15803d,color:#fff
+    style MX fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style H1 fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style H2 fill:#a855f7,stroke:#7e22ce,color:#fff
+    style H3 fill:#6366f1,stroke:#4338ca,color:#fff
+    style H4 fill:#ec4899,stroke:#be185d,color:#fff
+    style CAT fill:#f97316,stroke:#c2410c,color:#fff
+    style WO fill:#22c55e,stroke:#15803d,color:#fff
 ```
 
 ### How to Read an Attention Map
@@ -269,28 +451,30 @@ graph TD
 An attention map is a `(seq_len, seq_len)` grid where cell `[i, j]` holds the weight that token position $i$ places on token position $j$ when computing its new representation. All values in a row sum to 1.0 because they come from a softmax. A bright cell means the model is drawing heavily from that source token. The diagram below shows what a well-trained attention map row might look like for position 0 in a sequence where `tokens[0] == tokens[5] == 7`.
 
 ```mermaid
-graph LR
-    subgraph SEQ["Input tokens  (seq_len=6, label=1 because pos0=pos5=7)"]
-        T0["Pos 0  tok=7"]
-        T1["Pos 1  tok=3"]
-        T2["Pos 2  tok=11"]
-        T3["Pos 3  tok=5"]
-        T4["Pos 4  tok=2"]
-        T5["Pos 5  tok=7"]
-    end
+flowchart LR
+    Q0["Position 0 sends query\ntok = 7"]
 
-    subgraph ROW0["Attention map row 0  (what position 0 attends to)"]
-        R0["Pos 0 → 0.12"]
-        R1["Pos 1 → 0.05"]
-        R2["Pos 2 → 0.06"]
-        R3["Pos 3 → 0.04"]
-        R4["Pos 4 → 0.07"]
-        R5["Pos 5 → 0.66  HIGH because same token value"]
-    end
+    A0["Pos 0  tok=7\nweight = 0.12"]
+    A1["Pos 1  tok=3\nweight = 0.05"]
+    A2["Pos 2  tok=11\nweight = 0.06"]
+    A3["Pos 3  tok=5\nweight = 0.04"]
+    A4["Pos 4  tok=2\nweight = 0.07"]
+    A5["Pos 5  tok=7\nweight = 0.66  MATCH"]
 
-    T0 -->|"query vector"| R0
-    T0 --> R1 & R2 & R3 & R4 & R5
-    T5 -.->|"matching key vector drives high weight"| R5
+    Q0 --> A0
+    Q0 --> A1
+    Q0 --> A2
+    Q0 --> A3
+    Q0 --> A4
+    Q0 -->|"same token ID drives high score"| A5
+
+    style Q0 fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style A0 fill:#d1d5db,stroke:#6b7280,color:#000
+    style A1 fill:#d1d5db,stroke:#6b7280,color:#000
+    style A2 fill:#d1d5db,stroke:#6b7280,color:#000
+    style A3 fill:#d1d5db,stroke:#6b7280,color:#000
+    style A4 fill:#d1d5db,stroke:#6b7280,color:#000
+    style A5 fill:#22c55e,stroke:#15803d,color:#fff
 ```
 
 > [!NOTE]
