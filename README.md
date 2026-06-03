@@ -104,7 +104,28 @@ Traditional sequence models like RNNs and CNNs process tokens either one at a ti
 > The key limitation of an MLP for sequence tasks is that it requires a fixed-size input vector. That is why mean pooling happens first - it collapses the variable-length sequence into one fixed-size vector before the MLP can process it. The collapsing is exactly where positional information is lost.
 
 > [!NOTE]
-> **What does "pairwise score between every token and every other token" mean?**
+> **MLP vs Self-Attention - what is the actual difference?**
+>
+> Both are learned transformations that take a vector (or set of vectors) as input and produce a new vector as output. The critical difference is *what information each operation is allowed to look at* when computing each output value.
+>
+> An MLP processes one fixed vector at a time. Every output number is a learned blend of every input number - but the blend is the same no matter what the input values are. The weights are fixed after training. If token 0 is a 7 and token 15 is also a 7, the MLP has no way to "notice" that match because it only ever sees the mean of all 16 tokens, not the individual values.
+>
+> Self-attention processes the entire sequence at once and computes its mixing weights *dynamically based on the input content*. The Q dot K scores change for every new sequence, because Q and K are functions of the token values themselves. If token 0 and token 15 both embed to similar vectors, their dot product is high, so token 0's updated representation draws heavily from token 15 - and vice versa. The attention pattern adapts to each individual input.
+>
+> | # | <sub>Property</sub> | <sub>MLP (baseline)</sub> | <sub>Self-Attention</sub> |
+> |---|---|---|---|
+> | 1 | <sub>Input shape</sub> | <sub>One fixed-size vector (after mean pooling)</sub> | <sub>Full sequence - all positions simultaneously</sub> |
+> | 2 | <sub>Mixing weights</sub> | <sub>Fixed after training - same blend for every input</sub> | <sub>Computed from Q dot K - changes for every new input</sub> |
+> | 3 | <sub>Positional awareness</sub> | <sub>None - mean pooling discards all position information</sub> | <sub>Full - each position attends to specific other positions</sub> |
+> | 4 | <sub>Can compare token 0 to token 15?</sub> | <sub>No - both are averaged away before processing</sub> | <sub>Yes - Q at position 0 can attend strongly to K at position 15</sub> |
+> | 5 | <sub>Output depends on input content?</sub> | <sub>No - same weight matrix applied regardless</sub> | <sub>Yes - attention scores are a function of the actual token values</sub> |
+> | 6 | <sub>Where positional info is lost</sub> | <sub>At mean pooling, before the MLP even runs</sub> | <sub>Never lost - position embeddings are added and carried through</sub> |
+> | 7 | <sub>Computation cost</sub> | <sub>O(seq) - linear in sequence length</sub> | <sub>O(seq squared) - every pair of positions is scored</sub> |
+> | 8 | <sub>Role in this project</sub> | <sub>Entire baseline model - no attention at all</sub> | <sub>Core of each encoder block - runs before the per-token FFN/MLP</sub> |
+>
+> The FFN inside each encoder block is also an MLP - but it runs *after* self-attention has already mixed positional information into each token's vector. By that point, the vector at position 0 already "knows" about position 15 (from the attention step), so the FFN is not throwing away positional information when it processes each position independently. It is refining a representation that already contains cross-position context.
+
+
 >
 > Take a 5-token sentence: `["The", "cat", "sat", "on", "mat"]`. A *pairwise* score means we compute one score for every possible ordered pair of positions - that is 5 x 5 = 25 scores total. Each score answers one specific question: *"when building token i's new representation, how much should it draw from token j?"*
 >
@@ -147,15 +168,15 @@ The scaling factor $\frac{1}{\sqrt{d_k}}$ in the attention formula is one of the
 
 ```mermaid
 flowchart TD
-    US1["WITHOUT scaling  d_k=64\nRaw scores: 32, 16, 8"]
-    US2["softmax output\n0.9999, 0.0001, ~0.0"]
-    US3["Near one-hot spike\nall weight on position 0"]
-    US4["Gradient ~0 for positions 1 and 2"]
+    US1["WITHOUT scaling  dk 64  Raw scores: 32, 16, 8"]
+    US2["softmax output  0.9999, 0.0001, near 0"]
+    US3["Near one-hot spike  all weight on position 0"]
+    US4["Gradient near zero for positions 1 and 2"]
     US5["Training signal LOST"]
 
-    SS1["WITH scaling  divide by sqrt 64 equals 8\nScaled scores: 4.0, 2.0, 1.0"]
-    SS2["softmax output\n0.84, 0.11, 0.04"]
-    SS3["Spread-out distribution\nall positions contribute"]
+    SS1["WITH scaling  divide by sqrt 64  Scaled scores: 4.0, 2.0, 1.0"]
+    SS2["softmax output  0.84, 0.11, 0.04"]
+    SS3["Spread-out distribution  all positions contribute"]
     SS4["Gradient flows to ALL positions"]
     SS5["Training signal PRESERVED"]
 
@@ -214,33 +235,20 @@ The atomic unit of the Transformer is scaled dot-product attention. The query ma
 > **What is an Attention Map?** After the softmax step, the output is a matrix of shape `(seq_len, seq_len)` called the **attention map** or attention weight matrix. Each row $i$ contains a probability distribution over all token positions, showing how much token $i$ "attends to" every other token. A value of `0.9` in row 3, column 0 means: when computing the updated representation for position 3, the model draws 90% of its information from position 0. These maps are what get visualized as heatmaps in `artifacts/attention_heatmap_layer*.png` - bright cells reveal which token pairs the model considers important for the classification decision.
 
 ```mermaid
-flowchart TD
-    INP["Input X  shape: batch, seq, embed_dim"]
-    WQ["W_Q projection\nbatch, heads, seq, head_dim"]
-    WK["W_K projection\nbatch, heads, seq, head_dim"]
-    WV["W_V projection\nbatch, heads, seq, head_dim"]
-    SCORES["Q dot K-T divided by sqrt d_k\nbatch, heads, seq, seq"]
-    MASK["Optional Mask\nadditive or boolean"]
-    SOFTMAX["Softmax\nAttention Weights\nbatch, heads, seq, seq"]
-    ATTENDED["Weights dot V\nbatch, heads, seq, head_dim"]
-    MERGE["Concat Heads\nbatch, seq, embed_dim"]
-    OUT["Output Projection W_O\nbatch, seq, embed_dim"]
+flowchart LR
+    INP["Input X  batch seq embed"]
+    PROJ["Project Q K V  each batch heads seq head_dim"]
+    SCORES["Q dot K-transpose  divided by sqrt head_dim  batch heads seq seq"]
+    MASK["Apply Mask  optional"]
+    SOFTMAX["Softmax  Attention Weights  batch heads seq seq"]
+    ATTENDED["Weights dot V  batch heads seq head_dim"]
+    MERGE["Concat all heads  batch seq embed"]
+    OUT["Output Projection W-O  batch seq embed"]
 
-    INP --> WQ
-    INP --> WK
-    INP --> WV
-    WQ --> SCORES
-    WK --> SCORES
-    MASK --> SCORES
-    SCORES --> SOFTMAX
-    SOFTMAX --> ATTENDED
-    WV --> ATTENDED
-    ATTENDED --> MERGE --> OUT
+    INP --> PROJ --> SCORES --> MASK --> SOFTMAX --> ATTENDED --> MERGE --> OUT
 
     style INP fill:#3b82f6,stroke:#1d4ed8,color:#fff
-    style WQ fill:#8b5cf6,stroke:#6d28d9,color:#fff
-    style WK fill:#8b5cf6,stroke:#6d28d9,color:#fff
-    style WV fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style PROJ fill:#8b5cf6,stroke:#6d28d9,color:#fff
     style SCORES fill:#f97316,stroke:#c2410c,color:#fff
     style MASK fill:#6b7280,stroke:#374151,color:#fff
     style SOFTMAX fill:#f97316,stroke:#c2410c,color:#fff
@@ -1191,11 +1199,37 @@ flowchart LR
 >
 > 4. **Compute the loss.** `CrossEntropyLoss` compares the 64 predicted logit pairs against the 64 true labels. It returns one number - the average loss across the batch.
 >
+>    **Where do the 64 logit pairs come from?**
+>    The forward pass outputs a tensor of shape `(64, 2)` - one row per sequence in the batch, two numbers per row. Those two numbers are the raw unnormalized scores (logits) for class 0 ("endpoints differ") and class 1 ("endpoints match"). For example:
+>    ```
+>    Sequence 0:  logits = [-1.2,  2.4]   → model thinks class 1 (match) is much more likely
+>    Sequence 1:  logits = [ 0.9, -0.3]   → model thinks class 0 (differ) is slightly more likely
+>    Sequence 2:  logits = [ 0.1,  0.2]   → model is nearly uncertain
+>    ...
+>    Sequence 63: logits = [-2.1,  3.1]   → model is very confident class 1
+>    ```
+>    The two numbers per row are the "logit pair." CrossEntropyLoss converts each pair to a probability via softmax, then measures how wrong the winning class probability is.
+>
+>    **Where do the 64 true labels come from?**
+>    The DataLoader loaded them from the dataset alongside the sequences. Each sequence was generated with a known ground-truth label (0 or 1) computed from whether `tokens[0] == tokens[-1]`. The 64 labels are a 1-D integer tensor:
+>    ```
+>    labels = [1, 0, 0, 1, 1, 0, 1, 0, ...]   shape: (64,)
+>                                                each value is 0 or 1
+>    ```
+>    CrossEntropyLoss pairs row 0 of the logits with `labels[0]`, row 1 with `labels[1]`, and so on across all 64 rows, computing one loss value per pair and then averaging them into a single scalar.
+>
 > 5. **Backward pass.** `loss.backward()` traces back through every operation in the forward pass and computes the gradient of the loss with respect to every weight in the model. This uses the chain rule of calculus automatically. Every weight now has a `.grad` value saying "if I increase this weight slightly, the loss goes up/down by this much."
 >
-> 6. **Weight update.** `optimizer.step()` reads every weight's `.grad` value and applies the Adam update rule - a slightly more sophisticated version of "move each weight a small step in the direction that decreases loss." Adam also tracks momentum (recent gradient history) to smooth out noisy updates.
+> 6. **Weight update.** `optimizer.step()` reads every weight's `.grad` value and applies the Adam update rule.
 >
-> 7. **Repeat 62 times.** After all 62 batches, the epoch is done. Then one validation pass runs steps 1 and 3 only (no backward, no update - just measuring) to see how well the current weights perform on unseen data.
+>    **What is the Adam update rule?** Plain gradient descent would update each weight by subtracting a fixed fraction of its gradient: `weight = weight - lr * gradient`. That works but is fragile - if the gradient is noisy or the landscape curves sharply in one direction, fixed-step updates overshoot or stall. Adam improves on this in two ways:
+>    - It tracks a **running average of past gradients** (momentum) so one unusually large or small gradient does not cause a wild update - the step size is smoothed over recent history.
+>    - It tracks a **running average of past squared gradients** (adaptive scaling) so weights that have been getting large gradients take smaller steps, and weights that have been getting tiny gradients take relatively larger steps. Each weight gets its own effective learning rate.
+>    The result is that Adam is much more robust to noisy gradients and bad initial learning rate choices than plain gradient descent.
+>
+> 7. **Repeat 62 times.** After all 62 batches, the epoch is done. Then one **validation pass** runs steps 1 and 3 only - no backward pass, no weight update, just measuring.
+>
+>    **What does "just measuring" mean?** During the validation pass, `torch.no_grad()` is active, which disables gradient tracking entirely. The model runs the exact same forward pass as in step 3, producing logits and computing loss, but none of those operations are recorded for backpropagation. The weights are frozen - nothing changes. The only purpose is to compute the loss and accuracy on the validation set so you can see how the model performs on sequences it was not trained on. That number is what gets plotted as the validation curve.
 >
 > The whole loop then repeats from epoch 2, starting with reshuffled batches but keeping the weights from where epoch 1 left off.
 
