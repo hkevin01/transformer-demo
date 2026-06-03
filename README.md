@@ -1149,6 +1149,37 @@ Query pos5 |  █     ░     ░     ░     ░     ▒    <- pos5 attends str
 ```
 The bright cells at `[0,5]` and `[5,0]` are the signal: the model found the matching endpoint pair. This head is directly solving the task. Val accuracy with this pattern: ~97%.
 
+> [!NOTE]
+> **How do you actually know a heatmap is "good" - does a human have to look at it?**
+>
+> Short answer: yes and no. There are two independent ways to verify, and they check different things.
+>
+> **Way 1 - the number tells you: validation accuracy.**
+> You do not need to look at a single heatmap to know if the model learned the task. The val accuracy printed during training is the ground truth signal. If it reaches ~97%, the model solved it. If it is stuck at ~60% (barely better than a coin flip), the model failed regardless of what the heatmaps look like. The number comes from comparing the model's predicted class to the known correct label for 800 held-out sequences - a truth table comparison that runs automatically every epoch. You do not need a human to read it.
+>
+> **Way 2 - the heatmap tells you: what mechanism the model used.**
+> Once you know val accuracy is high, the heatmap answers a different question: *how* did it get there? Did it find the endpoint pair specifically, or did it accidentally memorize something else? You can also check this programmatically without visual inspection - run this after loading the model:
+>
+> ```python
+> # For each test sequence where label=1 (endpoints match),
+> # check whether the attention weight at [0, seq_len-1] is above a threshold.
+> # A well-trained task-solving head will have high weight there.
+>
+> model.eval()
+> with torch.no_grad():
+>     logits, attn_maps = model(tokens.unsqueeze(0))
+>
+> # attn_maps[layer_idx] shape: (batch, heads, seq, seq)
+> for layer in range(len(attn_maps)):
+>     for head in range(attn_maps[layer].shape[1]):
+>         w = attn_maps[layer][0, head]          # (seq, seq) for first sample
+>         endpoint_score = w[0, -1].item()       # weight pos0 places on pos15
+>         print(f"Layer {layer+1} Head {head+1}: w[0,-1] = {endpoint_score:.3f}")
+> ```
+> A task-solving head on a matching sequence will print a value of 0.5 or higher for `w[0,-1]`. A flat or saturated head will print something near `1/seq_len = 0.0625` (flat) or `0.0` (saturated, all weight is on self).
+>
+> **The visual inspection is for understanding, not verification.** You open the PNG when you want to debug *why* accuracy is low - is it saturation? flat? proximity-only? The heatmap gives you a diagnosis. But "is it good?" is answered by the number, not the picture. The picture answers "what went wrong?" or "what did it learn exactly?"
+
 **BAD heatmap - saturated (scaling missing or learning rate too high early):**
 ```
          Key: pos0  pos1  pos2  pos3  pos4  pos5
