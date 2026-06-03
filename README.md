@@ -76,6 +76,34 @@ You cannot read those numbers and know they mean "cat." The model discovered dur
 
 **Block 3 and beyond** (in BERT/GPT-scale models) - each additional block adds another round of this refinement. By Block 6, `"cat"` might encode "I am the grammatical subject of this sentence, and the sentence has a simple subject-verb-object structure." By Block 12, the representations carry abstract semantic roles that have little resemblance to the original token embedding - the model has built a deep structural understanding layered pass by pass.
 
+**How does it "know" grammar - where do those rules come from? Is it just matrices?**
+
+Yes - it is entirely matrices. There are no grammar rules written anywhere. No programmer typed "subject comes before verb in English." The model has never been told what a noun or verb is. What happened instead is this:
+
+The model was trained on an enormous amount of text (in BERT's case, the entire English Wikipedia plus thousands of books). During training, the only signal it received was: *"predict the missing word"* or *"predict whether these two sentences follow each other."* That is the entire task. No labels. No grammar annotations. Just: given this text, what comes next or what is missing?
+
+To get good at that prediction task, the model had to discover - entirely on its own - that certain tokens tend to appear in certain positions relative to other tokens, that certain word patterns repeat across millions of sentences, and that capturing those patterns helps prediction accuracy. The W_Q, W_K, W_V, and W_O matrices in every attention head, and the two weight matrices in every FFN, were all initialized as random noise and then adjusted billions of times by gradient descent - each adjustment saying "these weights produced a slightly wrong prediction, nudge them in the direction that would have been slightly more correct."
+
+After enough of those nudges across enough sentences, the weight matrices settled into configurations that happen to encode grammatical structure - not because anyone told them to, but because grammatical structure is the most efficient way to compress the patterns in English text. The model discovered grammar as a side effect of being very good at predicting words.
+
+**What does "encode grammatical subject" actually mean in matrix terms?**
+
+It means the 64 numbers in `"cat"`'s vector, after passing through 6 blocks of attention and FFN operations, have been pushed to a region of 64-dimensional space that is shared by other grammatical subjects across millions of training sentences. The vector for `"Alice"` in "Alice runs" ended up nearby. The vector for `"the dog"` in "the dog barked" ended up nearby. Not because any rule said "put subjects together" - but because those tokens all appeared in the same structural position relative to verbs across the training data, so the weight matrices that minimize prediction error naturally cluster them.
+
+Every piece of "knowledge" in the model is stored as a number in one of the weight matrices. There is no separate knowledge base, no rule engine, no symbolic representation. The entire model - all its "understanding" of language structure, semantics, and context - is a set of floating-point numbers arranged in matrices. What looks like reasoning from the outside is matrix multiplications applied in sequence, where the matrices were shaped by gradient descent to capture statistical patterns in training data.
+
+```
+Total "knowledge" stored in a BERT-base model:
+  12 layers x (W_Q + W_K + W_V + W_O) x (768 x 64) per head x 12 heads
+  + 12 layers x 2 FFN matrices x (768 x 3072)
+  + token embedding table (30522 vocab x 768 dims)
+  = ~110 million floating-point numbers
+
+That is it. 110M numbers. No rules. No grammar book.
+All of English syntax, semantics, and world knowledge compressed into a list of numbers
+that were nudged into place by seeing enough examples of correct language.
+```
+
 In this project the task is simple enough that 2 blocks is optimal - Block 1 finds which token IDs match anywhere in the sequence, Block 2 confirms the matching pair is specifically at positions 0 and 15. A third block would have nothing new to discover.
 
 **What this project demonstrates:** a 2-block Transformer encoder trained on a toy task (does token[0] equal token[15]?) alongside a baseline model that has no attention. The Transformer learns to directly compare the two endpoints. The baseline, which only sees the average of all tokens, cannot reliably do this - making the value of self-attention concrete and measurable.
