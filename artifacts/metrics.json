@@ -1,0 +1,48 @@
+{
+  "transformer": {
+    "train_loss": [
+      0.48533026687800884
+    ],
+    "val_loss": [
+      0.23047539591789246
+    ],
+    "train_acc": [
+      0.81640625
+    ],
+    "val_acc": [
+      0.953125
+    ]
+  },
+  "baseline": {
+    "train_loss": [
+      0.5755898877978325
+    ],
+    "val_loss": [
+      0.4671749174594879
+    ],
+    "train_acc": [
+      0.9140625
+    ],
+    "val_acc": [
+      0.953125
+    ]
+  },
+  "config": {
+    "seed": 42,
+    "epochs": 1,
+    "lr": 0.001,
+    "weight_decay": 0.0001,
+    "embed_dim": 64,
+    "num_heads": 4,
+    "ff_hidden_dim": 128,
+    "num_layers": 2,
+    "dropout": 0.1,
+    "artifacts_dir": "artifacts",
+    "vocab_size": 20,
+    "seq_len": 16,
+    "train_size": 256,
+    "val_size": 64,
+    "test_size": 64,
+    "batch_size": 32
+  }
+}
