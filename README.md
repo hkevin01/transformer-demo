@@ -51,7 +51,19 @@ Concretely, for a sequence of 16 tokens, self-attention computes a `16 x 16` sco
 - A **feed-forward network** (a small MLP applied independently to each position after attention) that adds nonlinear transformation capacity
 - **Residual connections and layer normalization** around both sub-layers that stabilize gradients and allow stacking many blocks without the signal vanishing
 
-Multiple blocks are stacked - each one takes the output of the previous block and refines the representations further. Block 1 learns surface-level token relationships. Block 2 can reason about patterns of patterns. Real models like BERT use 12 blocks; GPT-2 uses 24.
+Multiple blocks are stacked - each one takes the output of the previous block and refines the representations further. Real models like BERT use 12 blocks; GPT-2 uses 24.
+
+Here is what that stacking looks like concretely using `["cat", "sat", "mat"]`:
+
+**Before any block** - each token is just its raw embedding. `"cat"` is a 64-dim vector that encodes "I am the word cat." It knows nothing about what surrounds it. `"sat"` knows nothing about `"cat"`. Each token is isolated.
+
+**After Block 1** - self-attention has run once. Every token has now "looked at" every other token and updated its own vector. The new vector for `"cat"` is no longer just "I am cat" - it is "I am cat, and I appear right before the verb sat, and the sentence ends with mat which rhymes with me." `"sat"` now encodes "I am the verb, my subject is cat." The vectors carry context, not just identity.
+
+**After Block 2** - Block 2 receives those already-enriched vectors, not the raw embeddings. It now runs attention over representations that already contain context. `"cat"` no longer asks "which tokens are near me?" - it asks "which of these already-contextualized vectors are structurally similar to mine?" Block 2 can detect higher-order patterns: "cat and mat are both nouns that appear in subject and object positions" - something Block 1 could not see because Block 1 only had raw token identity to work with. Block 2 is reasoning about the patterns that Block 1 already found.
+
+**Block 3 and beyond** (in BERT/GPT-scale models) - each additional block adds another round of this refinement. By Block 6, `"cat"` might encode "I am the grammatical subject of this sentence, and the sentence has a simple subject-verb-object structure." By Block 12, the representations carry abstract semantic roles that have little resemblance to the original token embedding - the model has built a deep structural understanding layered pass by pass.
+
+In this project the task is simple enough that 2 blocks is optimal - Block 1 finds which token IDs match anywhere in the sequence, Block 2 confirms the matching pair is specifically at positions 0 and 15. A third block would have nothing new to discover.
 
 **What this project demonstrates:** a 2-block Transformer encoder trained on a toy task (does token[0] equal token[15]?) alongside a baseline model that has no attention. The Transformer learns to directly compare the two endpoints. The baseline, which only sees the average of all tokens, cannot reliably do this - making the value of self-attention concrete and measurable.
 
