@@ -46,6 +46,16 @@ The task chosen to demonstrate the model is **toy sequence classification**: giv
 
 Traditional sequence models like RNNs and CNNs process tokens either one at a time or within a fixed local window. This makes it structurally difficult for them to relate tokens that are far apart in a sequence. Self-attention solves this by computing a **direct pairwise relationship score between every token and every other token** in the sequence simultaneously. The result is a weighted mixture of all token representations, where the weights reflect how relevant each other position is when computing the representation for the current position.
 
+| # | <sub>Architecture</sub> | <sub>How it reads tokens</sub> | <sub>Long-range dependency</sub> | <sub>Parallel over sequence</sub> | <sub>Learns from position</sub> | <sub>This project uses it?</sub> |
+|---|---|---|---|---|---|---|
+| 1 | <sub>RNN / LSTM</sub> | <sub>One token at a time, left to right</sub> | <sub>Weak - signal fades over many steps (vanishing gradient)</sub> | <sub>No - each step depends on the previous</sub> | <sub>Implicitly via recurrent state</sub> | <sub>No</sub> |
+| 2 | <sub>CNN (1D)</sub> | <sub>Fixed local window of k adjacent tokens</sub> | <sub>Only if many layers stacked to reach distant positions</sub> | <sub>Yes - all windows computed at once</sub> | <sub>Yes - relative offsets within window</sub> | <sub>No</sub> |
+| 3 | <sub>Self-Attention (this project)</sub> | <sub>Every token attends to every other token simultaneously</sub> | <sub>Strong - any two positions connect in one step regardless of distance</sub> | <sub>Yes - all pairwise scores computed in one matrix multiply</sub> | <sub>Via added positional embedding</sub> | <sub>Yes</sub> |
+| 4 | <sub>MLP on mean-pooled embeddings (baseline)</sub> | <sub>Averages all token embeddings then applies MLP</sub> | <sub>None - positional information is lost in the average</sub> | <sub>Yes</sub> | <sub>No - position destroyed by pooling</sub> | <sub>Yes (baseline only)</sub> |
+
+> [!NOTE]
+> The table above is why the baseline struggles on the endpoint equality task. After mean pooling, position 0 and position 15 are indistinguishable from any other position - the model cannot tell them apart to compare their token IDs.
+
 > [!NOTE]
 > **What does "pairwise score between every token and every other token" mean?**
 >
@@ -341,9 +351,52 @@ flowchart TD
     style MAPS fill:#fbbf24,stroke:#d97706,color:#000
 ```
 
+### Tensor Shape Flow Through the Model
+
+Every operation in the forward pass transforms the tensor shape in a specific way. This table traces a single batch of 64 sequences through every layer so you can see exactly what shape is entering and leaving each component.
+
+| # | <sub>Layer / Operation</sub> | <sub>Input shape</sub> | <sub>Output shape</sub> | <sub>What changes and why</sub> |
+|---|---|---|---|---|
+| 1 | <sub>Input token IDs</sub> | <sub>-</sub> | <sub>(64, 16)</sub> | <sub>batch=64 sequences, each 16 integer token IDs</sub> |
+| 2 | <sub>Token embedding lookup</sub> | <sub>(64, 16)</sub> | <sub>(64, 16, 64)</sub> | <sub>Each integer maps to a 64-dim learned vector</sub> |
+| 3 | <sub>Positional embedding lookup</sub> | <sub>(64, 16)</sub> | <sub>(64, 16, 64)</sub> | <sub>Each position index maps to a 64-dim learned vector</sub> |
+| 4 | <sub>Embedding sum</sub> | <sub>(64, 16, 64) + (64, 16, 64)</sub> | <sub>(64, 16, 64)</sub> | <sub>Token identity + position fused into one vector per token</sub> |
+| 5 | <sub>Q, K, V projections (per head, per layer)</sub> | <sub>(64, 16, 64)</sub> | <sub>(64, 16, 16) each</sub> | <sub>Full 64-dim split into 4 x 16-dim subspaces</sub> |
+| 6 | <sub>Scaled dot-product attention (per head)</sub> | <sub>Q,K: (64, 16, 16) V: (64, 16, 16)</sub> | <sub>(64, 16, 16)</sub> | <sub>Attended output - same shape as V; attention map is (64, 16, 16)</sub> |
+| 7 | <sub>Concat all heads</sub> | <sub>4 x (64, 16, 16)</sub> | <sub>(64, 16, 64)</sub> | <sub>Four 16-dim outputs placed side by side</sub> |
+| 8 | <sub>Output projection W_O</sub> | <sub>(64, 16, 64)</sub> | <sub>(64, 16, 64)</sub> | <sub>64x64 matrix blends the concatenated heads</sub> |
+| 9 | <sub>Residual add + LayerNorm</sub> | <sub>(64, 16, 64) + (64, 16, 64)</sub> | <sub>(64, 16, 64)</sub> | <sub>Shape unchanged - stabilizes activations</sub> |
+| 10 | <sub>Feed-forward network</sub> | <sub>(64, 16, 64)</sub> | <sub>(64, 16, 64)</sub> | <sub>Expands to 128 internally then back to 64</sub> |
+| 11 | <sub>Residual add + LayerNorm</sub> | <sub>(64, 16, 64)</sub> | <sub>(64, 16, 64)</sub> | <sub>Shape unchanged - end of one encoder block</sub> |
+| 12 | <sub>Encoder Block 2 (same as 5-11)</sub> | <sub>(64, 16, 64)</sub> | <sub>(64, 16, 64)</sub> | <sub>Second pass; operates on enriched vectors from Block 1</sub> |
+| 13 | <sub>Mean pool over sequence</sub> | <sub>(64, 16, 64)</sub> | <sub>(64, 64)</sub> | <sub>Average across 16 positions - sequence dimension removed</sub> |
+| 14 | <sub>Classifier Linear 1 + ReLU</sub> | <sub>(64, 64)</sub> | <sub>(64, 64)</sub> | <sub>Nonlinear transform, shape preserved</sub> |
+| 15 | <sub>Classifier Linear 2 (output)</sub> | <sub>(64, 64)</sub> | <sub>(64, 2)</sub> | <sub>Projects to 2 class logits (label 0 or 1)</sub> |
+
+> [!NOTE]
+> Steps 5-11 describe a single encoder block. With `num_layers=2` those steps execute twice in sequence. The sequence dimension (16) is present through step 12 and only collapses at step 13 (mean pooling). Everything from step 14 onward works on one vector per sequence in the batch.
+
+---
+
 ### Training Pipeline
 
 Both the Transformer and the Baseline are trained using the same data splits, optimizer family, and loss function so the comparison is apples-to-apples. Each epoch runs a full pass over the training set with gradient updates, followed by a validation pass in `torch.no_grad()` context. Metrics are collected per epoch and persisted at the end.
+
+#### Training Hyperparameter Reference
+
+Every hyperparameter that affects training behavior is listed below with its default value, the flag to change it, what it controls, and what happens if you push it too high or too low.
+
+| # | <sub>Hyperparameter</sub> | <sub>Default</sub> | <sub>CLI flag</sub> | <sub>What it controls</sub> | <sub>Too low causes</sub> | <sub>Too high causes</sub> |
+|---|---|---|---|---|---|---|
+| 1 | <sub>epochs</sub> | <sub>15</sub> | <sub>`--epochs`</sub> | <sub>How many full passes over training data</sub> | <sub>Underfitting - model has not converged</sub> | <sub>Overfitting - memorizes training set</sub> |
+| 2 | <sub>batch-size</sub> | <sub>64</sub> | <sub>`--batch-size`</sub> | <sub>Sequences per gradient update step</sub> | <sub>Noisy gradients, slow wall-clock time</sub> | <sub>Smooth but sharp minima, higher memory use</sub> |
+| 3 | <sub>lr (learning rate)</sub> | <sub>1e-3</sub> | <sub>`--lr`</sub> | <sub>Step size for Adam weight updates</sub> | <sub>Very slow convergence</sub> | <sub>Loss diverges or oscillates</sub> |
+| 4 | <sub>embed-dim</sub> | <sub>64</sub> | <sub>`--embed-dim`</sub> | <sub>Dimensionality of all token and positional vectors</sub> | <sub>Model lacks capacity to represent token differences</sub> | <sub>Overkill for this toy task, slower training</sub> |
+| 5 | <sub>num-heads</sub> | <sub>4</sub> | <sub>`--num-heads`</sub> | <sub>Number of parallel attention heads</sub> | <sub>1 head must learn all relationship types at once</sub> | <sub>head-dim too small to encode useful queries/keys</sub> |
+| 6 | <sub>num-layers</sub> | <sub>2</sub> | <sub>`--num-layers`</sub> | <sub>Number of stacked encoder blocks</sub> | <sub>1 round of attention may miss complex patterns</sub> | <sub>Vanishing gradients, more compute for no gain on this task</sub> |
+| 7 | <sub>dropout</sub> | <sub>0.1</sub> | <sub>`--dropout`</sub> | <sub>Fraction of activations randomly zeroed during training</sub> | <sub>0.0 - no regularization, overfits small datasets</sub> | <sub>0.5+ - too much noise, model cannot converge</sub> |
+| 8 | <sub>seq-len</sub> | <sub>16</sub> | <sub>`--seq-len`</sub> | <sub>Length of every generated sequence</sub> | <sub>Task is trivially easy (position 0 and 1 are neighbors)</sub> | <sub>Harder long-range task, needs more heads/layers</sub> |
+| 9 | <sub>vocab-size</sub> | <sub>20</sub> | <sub>`--vocab-size`</sub> | <sub>Number of distinct token IDs (0 to N-1)</sub> | <sub>High duplicate rate makes task too easy</sub> | <sub>Very rare duplicates - class imbalance worsens</sub> |
 
 ```mermaid
 sequenceDiagram
@@ -435,7 +488,9 @@ Single-head attention runs the scaled dot-product attention once over the full `
 >
 > **Concrete analogy.** Imagine four reviewers each reading the same document and highlighting different things: one marks character names, one marks dates, one marks locations, one marks emotions. They hand their highlighted copies to an editor (W_O) who reads all four simultaneously and writes a single synthesis. The editor decides how much weight to give each reviewer's highlights when composing the final summary. That synthesis is what gets passed to the next encoder block.
 >
-> **Why this is better than averaging.** If you averaged the four head outputs instead of concatenating and projecting, you would mix information from all four heads uniformly and permanently - the model could not learn to use Head 1's information for one part of the representation and Head 2's for another. The concat-then-project design preserves all 64 dimensions and gives `W_O` the freedom to route each head's signal to exactly where it is most useful.
+> **Why passing it to the next block matters.** Each encoder block takes the output of the previous block as its input - so the second block does not see the original raw token embeddings, it sees the already-enriched context vectors that the first block produced. This means Block 2's attention heads are not asking "which raw token IDs are similar?" - they are asking "which already-contextualized representations are similar?" The model builds understanding in layers. Block 1 might learn low-level patterns (token identity, proximity). Block 2 receives those patterns baked into the vectors and can detect higher-level structure on top of them - like noticing that two positions both have the "this token appeared elsewhere" signal from Block 1, and amplifying that into a stronger classification signal. Without stacking blocks, the model is limited to one round of cross-token communication. Each additional block is another full round where every token can update its representation based on what all other tokens now look like after the previous round.
+>
+> **Why this is better than averaging - and no, single-head does not average either.** Single-head attention does not average the head outputs - there is only one head, so there is nothing to combine. What single-head does instead is run the full scaled dot-product attention once over the entire 64-dimensional space in one shot, producing a single 64-dim attended output directly. The averaging comparison is about a hypothetical bad design where you replace the concat-then-project step with a simple mean across the four head outputs. That bad design would produce `(H1 + H2 + H3 + H4) / 4` - a 16-dim vector where every head contributed exactly 25% to every output dimension, with no learned routing. The actual multi-head design instead places all four 16-dim outputs side by side (preserving all 64 dimensions separately) and then lets W_O - a full 64x64 matrix - decide how to blend them. W_O can put 80% of Head 1's signal into the first 20 output dimensions and nearly zero elsewhere, while simultaneously routing Head 2's signal heavily into a different set of dimensions. That selective routing is what makes multi-head strictly more expressive than either single-head or a naive average.
 
 ```mermaid
 flowchart LR
@@ -511,6 +566,16 @@ flowchart TD
 ### What Each Head Actually Learns - Perspectives and Examples
 
 The four heads do not receive different inputs - they all start from the same token embeddings. What makes them different is that each head has its own independently trained Q, K, V weight matrices. Because the loss function only cares about the final classification, each head is free to discover whatever internal representation helps most. Training pressure naturally pushes them toward complementary roles, because if two heads learned identical patterns they would both occupy 16 dimensions of the output doing the same job - a waste the optimizer tends to avoid.
+
+| # | <sub>Head</sub> | <sub>Likely role</sub> | <sub>Q looks for</sub> | <sub>K responds to</sub> | <sub>Attention pattern shape</sub> | <sub>Fires strongest when</sub> |
+|---|---|---|---|---|---|---|
+| 1 | <sub>Head 1 - Identity</sub> | <sub>Token exact match</sub> | <sub>Vectors similar to the query token's embedding</sub> | <sub>Tokens with same ID as query</sub> | <sub>Off-diagonal bright spots where token IDs match</sub> | <sub>A duplicate token exists anywhere in the sequence</sub> |
+| 2 | <sub>Head 2 - Proximity</sub> | <sub>Neighboring context</sub> | <sub>Nearby positions</sub> | <sub>Adjacent or near-adjacent positions</sub> | <sub>Bright band along the main diagonal</sub> | <sub>Duplicate tokens are adjacent (positions i and i+1)</sub> |
+| 3 | <sub>Head 3 - Repetition</sub> | <sub>Prior occurrence detection</sub> | <sub>Positions where this token has appeared earlier</sub> | <sub>Earlier positions with matching token</sub> | <sub>Lower-triangular bright spots at matching positions</sub> | <sub>Current position is a second (or later) occurrence</sub> |
+| 4 | <sub>Head 4 - Fallback</sub> | <sub>Global average context</sub> | <sub>Broadly distributed across all positions</sub> | <sub>All positions roughly equally</sub> | <sub>Nearly uniform gray across all cells</sub> | <sub>Always active; stabilizes when Heads 1-3 are uncertain</sub> |
+
+> [!NOTE]
+> These roles emerge from training - they are not programmed. The table reflects what gradient descent tends to discover on this task. A different random seed may swap which head index takes which role, but the model almost always converges to having at least one head that solves the identity-match problem (because it is the most direct path to low loss).
 
 Below are the four plausible specializations for this particular task (finding duplicate tokens in a sequence), along with a concrete worked example for the sentence-like token sequence `[7, 3, 11, 7, 5, 2]` where token `7` appears twice at positions 0 and 3.
 
@@ -726,6 +791,168 @@ flowchart LR
 
 > [!NOTE]
 > Each encoder layer produces one attention map per head, so with `num_layers=2` and `num_heads=4` you get 8 attention maps total per input sample. The visualize command saves them as a grid image per layer. Look for heads where the top-left to bottom-right diagonal is bright (self-attention is high) and where positions 0 and 15 have strong mutual attention - those are the heads that learned to solve the task.
+
+---
+
+## Where Does the Data Come From? How Does the Model Know Anything?
+
+This is one of the most important questions to understand about this project, because the answer is completely different from what most people expect when they first encounter transformers.
+
+**This model does not use the internet, pretrained weights, or any external knowledge. It starts knowing absolutely nothing and learns everything from randomly generated numbers.**
+
+---
+
+### The Data - Synthetically Generated From Scratch
+
+There is no dataset file downloaded from anywhere. Every training example is created on-the-fly by `src/data.py` using PyTorch's random number generator with a fixed seed.
+
+**What the data looks like:**
+
+```
+vocab_size = 20   (tokens are just integers 0-19, like made-up word IDs)
+seq_len    = 16   (every sequence is exactly 16 tokens long)
+train_size = 4000 (4000 random sequences generated for training)
+
+Example sequence:   [7, 3, 11, 4, 2, 17, 9, 14, 7, 0, 5, 12, 8, 6, 3, 7]
+                     ^                                               ^
+                     first token = 7                        last token = 7
+
+Label: 1  (first token matches last token - "yes, endpoint equality")
+
+Example sequence:   [3, 14, 7, 5, 11, 2, 18, 9, 4, 17, 6, 13, 1, 8, 12, 5]
+Label: 0  (first token = 3, last token = 5 - "no match")
+```
+
+**The task: endpoint equality.** Does the first token in the 16-position sequence equal the last token? That is the entire task. The labels are computed deterministically from the random sequences - no human labeling is involved. With a vocabulary of 20, the probability of a random match is exactly 1/20 = 5%, so the dataset is heavily imbalanced toward label=0.
+
+**Why this task?** It requires the model to learn long-range dependency - position 0 must somehow "talk to" position 15 despite 14 tokens in between. A model that only looks locally (like the baseline) cannot solve this well. It is a clean, controlled way to measure whether attention is working.
+
+---
+
+### The Weights - Randomly Initialized, Then Learned
+
+When you first create the model object, every single weight matrix - the Q, K, V projections, the feed-forward layers, the embeddings, the classifier - is filled with small random numbers drawn from a standard distribution (PyTorch's default `kaiming_uniform` or `xavier_uniform` initialization). At this point the model is completely random and produces meaningless output.
+
+```
+Before training - all weights are random noise:
+  token_embedding.weight:  random  (shape 20 x 64)
+  pos_embedding.weight:    random  (shape 16 x 64)
+  W_Q, W_K, W_V:           random  (shape 64 x 64 each, per head per layer)
+  W_O:                     random  (shape 64 x 64)
+  FFN weights:             random
+  classifier weights:      random
+
+Model accuracy on test set:  ~50%  (random guessing for a binary task)
+```
+
+Training runs `CrossEntropyLoss` on the model's predictions vs the true labels, computes gradients with backpropagation, and uses the `Adam` optimizer to nudge every weight slightly in the direction that reduces the loss. This repeats for every batch, every epoch.
+
+```
+After training - weights have been sculpted by gradient descent:
+  token_embedding.weight:  learned (tokens with similar roles cluster together)
+  pos_embedding.weight:    learned (encodes position 0 and 15 distinctly)
+  W_Q, W_K, W_V:           learned (Head 1 may now produce high Q.K scores
+                                    for tokens with matching IDs)
+  W_O:                     learned (routes Head 1's signal strongly to output)
+  FFN weights:             learned
+  classifier weights:      learned (thresholds the "match" signal into 0 or 1)
+
+Model accuracy on test set:  ~95%+
+```
+
+The trained weights are saved to `artifacts/transformer.pt`. When you run `evaluate` or `visualize`, those saved weights are loaded back in - that is the only "prior knowledge" the model has, and it came entirely from training on synthetic data.
+
+#### Weight Matrix Inventory
+
+Every learnable matrix in the model is listed below with its shape and parameter count. Understanding the size of each component shows where the model spends its capacity.
+
+| # | <sub>Weight matrix</sub> | <sub>Shape</sub> | <sub>Parameters</sub> | <sub>Count in model</sub> | <sub>Total params</sub> | <sub>What it encodes after training</sub> |
+|---|---|---|---|---|---|---|
+| 1 | <sub>Token embedding</sub> | <sub>(20, 64)</sub> | <sub>1,280</sub> | <sub>1</sub> | <sub>1,280</sub> | <sub>Meaning of each of the 20 token IDs</sub> |
+| 2 | <sub>Positional embedding</sub> | <sub>(16, 64)</sub> | <sub>1,024</sub> | <sub>1</sub> | <sub>1,024</sub> | <sub>Meaning of each of the 16 sequence positions</sub> |
+| 3 | <sub>W_Q per head per layer</sub> | <sub>(64, 16)</sub> | <sub>1,024</sub> | <sub>8 (4 heads x 2 layers)</sub> | <sub>8,192</sub> | <sub>What each head queries for</sub> |
+| 4 | <sub>W_K per head per layer</sub> | <sub>(64, 16)</sub> | <sub>1,024</sub> | <sub>8</sub> | <sub>8,192</sub> | <sub>What each head keys on</sub> |
+| 5 | <sub>W_V per head per layer</sub> | <sub>(64, 16)</sub> | <sub>1,024</sub> | <sub>8</sub> | <sub>8,192</sub> | <sub>What values each head extracts</sub> |
+| 6 | <sub>Output projection W_O per layer</sub> | <sub>(64, 64)</sub> | <sub>4,096</sub> | <sub>2</sub> | <sub>8,192</sub> | <sub>How to blend the 4 concatenated head outputs</sub> |
+| 7 | <sub>FFN Linear 1 per layer</sub> | <sub>(64, 128)</sub> | <sub>8,192</sub> | <sub>2</sub> | <sub>16,384</sub> | <sub>Expands token features to hidden dim 128</sub> |
+| 8 | <sub>FFN Linear 2 per layer</sub> | <sub>(128, 64)</sub> | <sub>8,192</sub> | <sub>2</sub> | <sub>16,384</sub> | <sub>Projects back to embed dim 64</sub> |
+| 9 | <sub>LayerNorm (attn + FFN per layer)</sub> | <sub>(64,) x2</sub> | <sub>128</sub> | <sub>4</sub> | <sub>512</sub> | <sub>Scale and shift for stable activations</sub> |
+| 10 | <sub>Classifier Linear 1</sub> | <sub>(64, 64)</sub> | <sub>4,096</sub> | <sub>1</sub> | <sub>4,096</sub> | <sub>Nonlinear feature transform before output</sub> |
+| 11 | <sub>Classifier Linear 2</sub> | <sub>(64, 2)</sub> | <sub>128</sub> | <sub>1</sub> | <sub>128</sub> | <sub>Maps pooled vector to 2 class logits</sub> |
+
+> [!NOTE]
+> The largest blocks by parameter count are the FFN layers (rows 7 and 8) which together account for ~32,768 parameters - more than half the model. The attention projections (rows 3-6) account for ~32,768 parameters split across 8 sets. Total trainable parameters: approximately **72,576**. For comparison, GPT-2 small has 117 million.
+
+---
+
+### The Embeddings - Lookup Tables Learned From Scratch
+
+> [!NOTE]
+> **What is `nn.Embedding`?** An embedding layer is just a lookup table - a matrix of shape `(vocab_size, embed_dim)` = `(20, 64)`. Token ID `7` means "fetch row 7 from this matrix." At initialization, row 7 is random. After training, row 7 has been updated hundreds of times by gradient descent until it encodes whatever 64-dimensional vector best helps the model recognize when token 7 appears at position 0 vs position 15. The embeddings are not loaded from word2vec, GloVe, or any language model - they are trained entirely from the endpoint equality task.
+
+There are two embedding tables:
+- **Token embedding** `(20, 64)` - one 64-dim vector per token ID (0-19)
+- **Positional embedding** `(16, 64)` - one 64-dim vector per sequence position (0-15)
+
+These two vectors are **added together** to form the input to the first encoder block. This is how the model simultaneously knows "this is token 7" and "this is at position 0."
+
+```
+Input token at position 0, value 7:
+
+  token_embedding[7]    = [0.45, -0.31,  0.91, ...]   <- "what token 7 means"
++ pos_embedding[0]      = [0.12,  0.88, -0.44, ...]   <- "what position 0 means"
+                         ─────────────────────────
+  combined input vector = [0.57,  0.57,  0.47, ...]   <- fed into encoder block
+```
+
+---
+
+### Comparison to GPT / BERT / LLMs
+
+> [!IMPORTANT]
+> This project is NOT a language model and has NO connection to GPT, BERT, or any large language model. Those models are architecturally similar (they use the same attention mechanism) but differ in every other way:
+
+| # | <sub>Aspect</sub> | <sub>This project</sub> | <sub>GPT-4 / BERT</sub> |
+|---|---|---|---|
+| 1 | <sub>Data</sub> | <sub>Synthetically generated random integers</sub> | <sub>Hundreds of billions of real text tokens from the internet</sub> |
+| 2 | <sub>Vocabulary</sub> | <sub>20 made-up token IDs</sub> | <sub>50,000+ real word/subword pieces</sub> |
+| 3 | <sub>Parameters</sub> | <sub>~50,000</sub> | <sub>Billions</sub> |
+| 4 | <sub>Starting weights</sub> | <sub>Random initialization</sub> | <sub>Pretrained on massive corpora, then fine-tuned</sub> |
+| 5 | <sub>Task</sub> | <sub>Does token[0] == token[15]?</sub> | <sub>Next-token prediction / masked token prediction on real language</sub> |
+| 6 | <sub>Training time</sub> | <sub>Seconds to minutes on CPU</sub> | <sub>Months on thousands of GPUs</sub> |
+| 7 | <sub>Knowledge</sub> | <sub>None - only knows the endpoint equality pattern</sub> | <sub>Encodes vast world knowledge from training corpus</sub> |
+
+The architecture is the same building block. The scale, data, and purpose are completely different. This project is a microscope for understanding how the attention mechanism works in isolation, without the complexity of real language getting in the way.
+
+```mermaid
+flowchart LR
+    RNG["PyTorch RNG\nseed=42\nfixed for reproducibility"]
+    GEN["build_endpoint_equality_split\ngenerate random integer sequences\nvocab_size=20  seq_len=16"]
+    LABEL["Compute labels\ntokens col0 == tokens col-1\nno human annotation"]
+    DATASET["EndpointEqualityDataset\n4000 train  800 val  800 test"]
+    LOADER["DataLoader\nbatch_size=64\nshuffled each epoch"]
+    MODEL["TransformerSequenceClassifier\nall weights random at init"]
+    LOSS["CrossEntropyLoss\npredictions vs true labels"]
+    OPT["Adam optimizer\nnudge weights to reduce loss"]
+    SAVE["artifacts/transformer.pt\ntrained weights saved here"]
+
+    RNG --> GEN --> LABEL --> DATASET --> LOADER --> MODEL --> LOSS --> OPT
+    OPT -->|"repeat for every batch every epoch"| MODEL
+    OPT --> SAVE
+
+    style RNG fill:#3b82f6,stroke:#1d4ed8,color:#fff
+    style GEN fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style LABEL fill:#6366f1,stroke:#4338ca,color:#fff
+    style DATASET fill:#14b8a6,stroke:#0f766e,color:#fff
+    style LOADER fill:#14b8a6,stroke:#0f766e,color:#fff
+    style MODEL fill:#f97316,stroke:#c2410c,color:#fff
+    style LOSS fill:#ec4899,stroke:#be185d,color:#fff
+    style OPT fill:#a855f7,stroke:#7e22ce,color:#fff
+    style SAVE fill:#22c55e,stroke:#15803d,color:#fff
+```
+
+> [!TIP]
+> Run `python src/main.py train` to watch the weights being learned from nothing. The loss printed each epoch drops as the model figures out the endpoint equality pattern. The final weights saved to `artifacts/transformer.pt` are the result of that entire learning process - nothing was loaded from outside.
 
 ---
 
