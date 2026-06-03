@@ -15,6 +15,48 @@
 
 ---
 
+## What Is a Transformer and What Is Self-Attention?
+
+**A Transformer is a neural network architecture built entirely around one core operation: self-attention.** It was introduced in the 2017 paper "Attention Is All You Need" (Vaswani et al.) and has since become the foundation of nearly every major language model - BERT, GPT, T5, LLaMA, and beyond.
+
+Before the Transformer, sequence models were built from RNNs or CNNs. RNNs read tokens one at a time left-to-right, carrying a hidden state forward. CNNs applied a sliding window of fixed size. Both are fundamentally limited: an RNN trying to compare token 0 to token 99 must pass information through 99 sequential steps, and earlier signal tends to get diluted or forgotten. A CNN with a window of size 5 simply cannot see across a gap of 50 positions at all.
+
+**The Transformer threw out the sequential processing entirely.** Every token in the sequence is processed simultaneously, and every token can directly "look at" every other token in a single operation - no matter how far apart they are. A 512-token sequence has the same connection cost between token 1 and token 512 as between token 1 and token 2. This is what makes Transformers so powerful for long-range dependencies.
+
+**How does every token score every other token without intermediate steps?** The mechanism is a single matrix multiplication. Here is the exact sequence:
+
+1. Every token vector (64 numbers) is multiplied by two small learned weight matrices - one called W_Q and one called W_K - to produce a **query vector** and a **key vector** for that token. Think of the query as the question a token is asking ("who should I pay attention to?") and the key as the label it broadcasts ("here is what I have to offer").
+
+2. To score token `i` against token `j`, you take the dot product of token `i`'s query vector and token `j`'s key vector. A dot product is just: multiply each pair of matching numbers together and sum them all up. One multiplication, one sum. That single number is the raw score for the pair `(i, j)`.
+
+3. To get *all* scores for *all* pairs at once, you stack every token's query into one matrix Q (shape `seq_len x head_dim`) and every token's key into one matrix K, then compute `Q @ K.T` - one matrix multiplication. That produces the complete `seq_len x seq_len` score matrix in a single GPU operation. No loops, no steps between token 1 and token 512. The matrix multiply touches every pair simultaneously.
+
+```
+Q  shape: (16 tokens x 16 dims)    each row is one token's query
+K  shape: (16 tokens x 16 dims)    each row is one token's key
+
+Q @ K.T  shape: (16 x 16)          cell [i,j] = dot(query_i, key_j)
+                                    computed for all 256 pairs in one operation
+```
+
+The reason this is "direct" is that there is no hidden state being passed around and no recurrence. Token 0's query vector and token 15's key vector are both sitting in memory at the same time, and the matrix multiply compares every pair simultaneously. Distance in the sequence has no effect on compute cost - `[0, 15]` and `[0, 1]` are both just one cell in the same matrix.
+
+**Self-attention is the mechanism that enables this.** Here is the core idea in plain English:
+
+> For each token in the sequence, self-attention asks: "given what I am, which other tokens in this sequence are most relevant to my meaning?" It then produces a new representation of that token as a weighted mixture of all other tokens - drawing heavily from the relevant ones and ignoring the rest. The weights are not fixed rules - they are computed dynamically from the actual content of the sequence, so the same token can attend to completely different positions depending on context.
+
+Concretely, for a sequence of 16 tokens, self-attention computes a `16 x 16` score matrix - one score for every ordered pair of positions. Score `[i, j]` answers: "how much should position `i` draw from position `j` when updating its representation?" After a softmax, those scores become attention weights (each row sums to 1.0) and are used to compute a weighted sum of all token values. The result is a new 64-dimensional vector for each position that now incorporates information from the entire sequence.
+
+**A Transformer encoder block** wraps self-attention with two additional components:
+- A **feed-forward network** (a small MLP applied independently to each position after attention) that adds nonlinear transformation capacity
+- **Residual connections and layer normalization** around both sub-layers that stabilize gradients and allow stacking many blocks without the signal vanishing
+
+Multiple blocks are stacked - each one takes the output of the previous block and refines the representations further. Block 1 learns surface-level token relationships. Block 2 can reason about patterns of patterns. Real models like BERT use 12 blocks; GPT-2 uses 24.
+
+**What this project demonstrates:** a 2-block Transformer encoder trained on a toy task (does token[0] equal token[15]?) alongside a baseline model that has no attention. The Transformer learns to directly compare the two endpoints. The baseline, which only sees the average of all tokens, cannot reliably do this - making the value of self-attention concrete and measurable.
+
+---
+
 ## Overview
 
 This project is a **fully runnable, from-scratch implementation** of the Transformer encoder architecture using PyTorch. It was built to make the internals of self-attention and the Transformer block concrete and inspectable rather than hiding them inside framework abstractions. Every component - scaled dot-product attention, multi-head self-attention, the position-wise feed-forward network, residual connections, and layer normalization - is implemented as a plain `nn.Module` and is readable in a few dozen lines of code.
@@ -84,22 +126,52 @@ Traditional sequence models like RNNs and CNNs process tokens either one at a ti
 >
 > MLP stands for Multi-Layer Perceptron - the most basic type of neural network, also called a "fully connected network" or "dense network." It is a sequence of linear layers (matrix multiplications) with nonlinear activation functions in between. Each layer takes a vector of numbers as input and produces a new vector of numbers as output, where every input number can contribute to every output number.
 >
+> **What does it look like physically?** A single linear layer is a matrix - a grid of numbers where each cell is a learned weight. When you multiply your input vector by that matrix, every output number is computed as a weighted sum of every input number. The matrix is the set of weights. The activation function (ReLU) is applied element-wise to the result - it is not a matrix, it is just a function that zeroes out any negative number. Then another matrix for the next layer.
+>
+> ```
+> What one linear layer looks like (small example: 3 inputs -> 4 outputs):
+>
+>  Input vector       Weight matrix W (3x4)        Output vector
+>  [x0, x1, x2]  @  [[w00, w01, w02, w03],    =   [y0, y1, y2, y3]
+>                     [w10, w11, w12, w13],
+>                     [w20, w21, w22, w23]]
+>
+>  y0 = x0*w00 + x1*w10 + x2*w20   <- every input contributed to y0
+>  y1 = x0*w01 + x1*w11 + x2*w21   <- every input contributed to y1
+>  y2 = x0*w02 + x1*w12 + x2*w22
+>  y3 = x0*w03 + x1*w13 + x2*w23
+>
+>  "Fully connected" means: every input wire connects to every output wire.
+>  The weight at that crossing point is what gets learned.
+> ```
+>
+> The full MLP in this project (baseline classifier) looks like this in sequence:
+>
+> ```
+>                      matrix multiply         ReLU        matrix multiply
+>  [64 numbers]  -->  Linear(64 -> 64)  -->  max(0,x)  -->  Linear(64 -> 2)  -->  [2 logits]
+>
+>  Layer 1 weight matrix:  64 rows x 64 cols  =  4096 learned numbers
+>  ReLU:                   not a matrix - just zeroes out negatives element-wise
+>  Layer 2 weight matrix:  64 rows x  2 cols  =   128 learned numbers
+>
+>  Total learnable weights in the classifier head:  4096 + 128 = 4224 numbers
+> ```
+>
+> The FFN inside each encoder block is the same structure but different sizes:
+>
+> ```
+>  [64 numbers]  -->  Linear(64 -> 128)  -->  ReLU  -->  Dropout  -->  Linear(128 -> 64)  -->  [64 numbers]
+>
+>  Layer 1:  64 x 128  =  8192 weights   (expands - finds richer patterns)
+>  Layer 2:  128 x 64  =  8192 weights   (compresses back - distills the patterns)
+> ```
+>
 > In this project, two things are called MLPs:
 >
 > - **The baseline model's "MLP on mean-pooled embeddings"** - the entire baseline classifier is just an MLP applied to the average of all token embeddings. It has no attention, no ability to look at specific positions, and no way to compare individual tokens to each other. It sees only the average.
 >
 > - **The feed-forward network (FFN) inside each encoder block** - this is also an MLP, but a small one applied per-token after attention. It has two linear layers: `Linear(64 -> 128) -> ReLU -> Dropout -> Linear(128 -> 64)`.
->
-> ```
-> A 2-layer MLP (what the baseline uses for classification):
->
->  Input vector          Hidden layer              Output
->  [v0, v1, ..., v63]  ->  Linear(64,64)  ->  ReLU  ->  Linear(64,2)  ->  [logit_0, logit_1]
->       64 numbers              64 numbers                                   2 numbers (class scores)
->
-> Every input number is connected to every hidden number (that is what "fully connected" means).
-> The weights of those connections are what get learned during training.
-> ```
 >
 > The key limitation of an MLP for sequence tasks is that it requires a fixed-size input vector. That is why mean pooling happens first - it collapses the variable-length sequence into one fixed-size vector before the MLP can process it. The collapsing is exactly where positional information is lost.
 
