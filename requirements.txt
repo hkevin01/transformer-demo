@@ -1,5 +1,5 @@
 torch>=2.2
 numpy>=1.26
-matplotlib>=3.8
+matplotlib>=3.10.9
 seaborn>=0.13
 tqdm>=4.66
